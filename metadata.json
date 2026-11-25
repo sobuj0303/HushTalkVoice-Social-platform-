@@ -1,0 +1,6 @@
+{
+  "name": "HushTalkVoice",
+  "description": "HushTalkVoice — Real-time social networking, voice-first messenger, and community video hub.",
+  "requestFramePermissions": ["microphone"],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

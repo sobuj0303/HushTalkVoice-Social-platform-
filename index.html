@@ -1,0 +1,67 @@
+<!doctype html>
+<html lang="en" class="dark" data-resolved-theme="night">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
+    <title>HushTalkVoice — Social Network, Messenger & Community Videos</title>
+    <meta name="description" content="HushTalkVoice — Real-time social networking, voice-first messenger, and community video hub." />
+    <meta name="theme-color" content="#130d22" />
+    <meta name="mobile-web-app-capable" content="yes" />
+    <meta name="apple-mobile-web-app-capable" content="yes" />
+    <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+    <meta name="apple-mobile-web-app-title" content="HushTalkVoice" />
+    <link rel="apple-touch-icon" href="/apple-touch-icon.png" />
+    <link rel="icon" type="image/svg+xml" href="/icon.svg" />
+    <link rel="icon" type="image/png" sizes="192x192" href="/pwa-192x192.png" />
+    <meta property="og:title" content="HushTalkVoice — Social Network, Messenger & Community Videos" />
+    <meta property="og:description" content="HushTalkVoice — Real-time social networking, voice-first messenger, and community video hub." />
+    <meta property="og:type" content="website" />
+    <meta name="twitter:card" content="summary_large_image" />
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link
+      href="https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;600;700&family=JetBrains+Mono:wght@400;600&family=Plus+Jakarta+Sans:wght@600;700&display=swap"
+      rel="stylesheet"
+      media="print"
+      onload="this.media='all'"
+    />
+    <noscript>
+      <link
+        href="https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;600;700&family=JetBrains+Mono:wght@400;600&family=Plus+Jakarta+Sans:wght@600;700&display=swap"
+        rel="stylesheet"
+      />
+    </noscript>
+    <script>
+      (function () {
+        try {
+          var saved = localStorage.getItem('htv_theme');
+          var mode = (saved === 'day' || saved === 'night' || saved === 'system') ? saved : 'night';
+          var prefersDark = window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches;
+          var resolved = mode === 'system' ? (prefersDark ? 'night' : 'day') : mode;
+          document.documentElement.setAttribute('data-resolved-theme', resolved);
+          if (resolved === 'night') {
+            document.documentElement.classList.add('dark');
+          } else {
+            document.documentElement.classList.remove('dark');
+          }
+        } catch (e) {}
+      })();
+      window.__htvDeferredInstallPrompt = null;
+      window.__htvAppInstalled = false;
+      window.addEventListener('beforeinstallprompt', function (e) {
+        e.preventDefault();
+        window.__htvDeferredInstallPrompt = e;
+        window.dispatchEvent(new CustomEvent('htv:pwa-install-ready'));
+      });
+      window.addEventListener('appinstalled', function () {
+        window.__htvAppInstalled = true;
+        window.__htvDeferredInstallPrompt = null;
+        window.dispatchEvent(new CustomEvent('htv:pwa-installed'));
+      });
+    </script>
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+</html>
