@@ -39,7 +39,10 @@ import type { PrivacySettings, ThemeMode } from './src/shared/types';
 initDatabase();
 
 const execFileAsync = promisify(execFile);
-const PORT = Number(process.env.PORT || 3000);
+const PORT =
+  process.env.NGINX_PORT && process.env.PORT === process.env.NGINX_PORT
+    ? Number(process.env.DEFAULT_APP_PORT || 3000)
+    : Number(process.env.PORT || 3000);
 const JWT_SECRET = process.env.JWT_SECRET || 'hushtalkvoice_dev_secret_change_in_prod';
 const UPLOAD_DIR = path.resolve(process.cwd(), 'uploads');
 const VARIANT_DIR = path.resolve(UPLOAD_DIR, 'variants');
@@ -63,11 +66,6 @@ const variantInFlight = new Map<string, Promise<string>>();
 interface AuthedRequest extends Request {
   userId?: number;
   userRole?: 'member' | 'admin';
-}
-
-interface WsClient {
-  ws: WebSocket;
-  userId: number;
 }
 
 const activeSockets = new Map<number, Set<WebSocket>>();
@@ -150,7 +148,9 @@ function requireAuth(req: AuthedRequest, res: Response, next: NextFunction): voi
     }
     req.userId = user.id;
     req.userRole = user.role;
-    db.prepare("UPDATE users SET last_seen = datetime('now') WHERE id = ?").run(user.id);
+    db.prepare(
+      "UPDATE users SET last_seen = datetime('now') WHERE id = ? AND last_seen < datetime('now', '-30 seconds')"
+    ).run(user.id);
     next();
   } catch {
     res.status(401).json({ error: 'Invalid or expired session.' });
@@ -514,7 +514,7 @@ async function bootstrap() {
       res.status(404).json({ error: 'No account found with that email address.' });
       return;
     }
-    const code = String(Math.floor(100000 + Math.random() * 900000));
+    const code = String(crypto.randomInt(100000, 1000000));
     db.prepare('UPDATE password_resets SET used = 1 WHERE user_id = ?').run(user.id);
     db.prepare(
       "INSERT INTO password_resets (user_id, code, expires_at) VALUES (?, ?, datetime('now', '+15 minutes'))"
@@ -636,6 +636,30 @@ async function bootstrap() {
     if (!full.startsWith(UPLOAD_DIR + path.sep)) return null;
     if (!fs.existsSync(full) || !fs.statSync(full).isFile()) return null;
     return full;
+  }
+
+  function cleanupUnusedUploadFile(rawUrl: unknown): void {
+    try {
+      const cleanUrl = typeof rawUrl === 'string' ? rawUrl.split('?')[0].split('#')[0].trim() : '';
+      if (!cleanUrl.startsWith('/uploads/') || cleanUrl.startsWith('/uploads/seed/')) return;
+      const rel = cleanUrl.replace(/^\/uploads\//, '');
+      const full = path.resolve(UPLOAD_DIR, rel);
+      if (!full.startsWith(UPLOAD_DIR + path.sep) || !fs.existsSync(full) || !fs.statSync(full).isFile()) {
+        return;
+      }
+      const stillReferenced =
+        db.prepare('SELECT 1 FROM posts WHERE media_url = ? LIMIT 1').get(cleanUrl) ||
+        db.prepare('SELECT 1 FROM circle_posts WHERE media_url = ? LIMIT 1').get(cleanUrl) ||
+        db.prepare('SELECT 1 FROM messages WHERE media_url = ? AND is_unsent = 0 LIMIT 1').get(cleanUrl) ||
+        db.prepare('SELECT 1 FROM videos WHERE video_url = ? OR thumbnail_url = ? LIMIT 1').get(cleanUrl, cleanUrl) ||
+        db.prepare('SELECT 1 FROM users WHERE avatar_url = ? OR cover_url = ? LIMIT 1').get(cleanUrl, cleanUrl) ||
+        db.prepare('SELECT 1 FROM circles WHERE avatar_url = ? LIMIT 1').get(cleanUrl);
+      if (!stillReferenced) {
+        fs.unlink(full, () => {});
+      }
+    } catch {
+      // Ignore cleanup errors so DB deletes remain reliable
+    }
   }
 
   async function ensureVideoVariant(sourcePath: string, quality: string): Promise<string> {
@@ -976,34 +1000,31 @@ async function bootstrap() {
     const filter = String(req.query.filter || 'all');
 
     const rows = db
-      .prepare('SELECT * FROM users WHERE id != ? AND is_blocked = 0')
-      .all(req.userId) as any[];
+      .prepare(
+        `SELECT
+           u.id, u.name, u.username, u.avatar_url, u.role, u.is_verified,
+           u.online_status_visibility, u.profile_visibility, u.bio,
+           (SELECT COUNT(*) FROM follows WHERE following_id = u.id) as followers_count,
+           (SELECT COUNT(*) FROM follows WHERE follower_id = u.id) as following_count,
+           EXISTS(SELECT 1 FROM follows WHERE follower_id = ? AND following_id = u.id) as is_following,
+           c.id as conn_id, c.requester_id as conn_requester_id, c.status as conn_status
+         FROM users u
+         LEFT JOIN connections c
+           ON (c.requester_id = ? AND c.receiver_id = u.id)
+           OR (c.requester_id = u.id AND c.receiver_id = ?)
+         WHERE u.id != ? AND u.is_blocked = 0`
+      )
+      .all(req.userId, req.userId, req.userId, req.userId) as any[];
 
     let mapped = rows.map((r) => {
-      const followersCount = (
-        db.prepare('SELECT COUNT(*) as c FROM follows WHERE following_id = ?').get(r.id) as { c: number }
-      ).c;
-      const followingCount = (
-        db.prepare('SELECT COUNT(*) as c FROM follows WHERE follower_id = ?').get(r.id) as { c: number }
-      ).c;
-      const isFollowing = Boolean(
-        db.prepare('SELECT 1 FROM follows WHERE follower_id = ? AND following_id = ?').get(req.userId, r.id)
-      );
-      const conn = db
-        .prepare(
-          `SELECT id, requester_id, status FROM connections
-           WHERE (requester_id = ? AND receiver_id = ?) OR (requester_id = ? AND receiver_id = ?)`
-        )
-        .get(req.userId, r.id, r.id, req.userId) as any;
-
       let connectionStatus: 'none' | 'pending_sent' | 'pending_received' | 'accepted' = 'none';
-      if (conn) {
-        if (conn.status === 'accepted') connectionStatus = 'accepted';
-        else if (conn.status === 'pending') {
-          connectionStatus = conn.requester_id === req.userId ? 'pending_sent' : 'pending_received';
-        }
+      if (r.conn_status === 'accepted') {
+        connectionStatus = 'accepted';
+      } else if (r.conn_status === 'pending') {
+        connectionStatus = r.conn_requester_id === req.userId ? 'pending_sent' : 'pending_received';
       }
 
+      const canViewProfile = r.profile_visibility === 'public' || connectionStatus === 'accepted';
       return {
         id: r.id,
         name: r.name,
@@ -1012,13 +1033,13 @@ async function bootstrap() {
         role: r.role,
         is_verified: Boolean(r.is_verified),
         is_online: canSeeOnlineStatus(req.userId!, r.id, r.online_status_visibility),
-        bio: r.profile_visibility === 'public' || connectionStatus === 'accepted' ? r.bio : 'Private profile',
-        followers_count: followersCount,
-        following_count: followingCount,
-        is_following: isFollowing,
+        bio: canViewProfile ? r.bio : 'Private profile',
+        followers_count: Number(r.followers_count || 0),
+        following_count: Number(r.following_count || 0),
+        is_following: Boolean(r.is_following),
         connection_status: connectionStatus,
-        connection_id: conn?.id,
-        can_view_profile: r.profile_visibility === 'public' || connectionStatus === 'accepted',
+        connection_id: r.conn_id ?? undefined,
+        can_view_profile: canViewProfile,
       };
     });
 
@@ -1180,9 +1201,11 @@ async function bootstrap() {
     viewerId: number,
     options: { filter?: string; userId?: number; postId?: number; verifiedOnly?: boolean; limit?: number; offset?: number } = {}
   ) {
-    let whereClause =
-      "u.is_blocked = 0 AND (p.circle_id IS NULL OR (c.privacy = 'public' AND p.is_global = 1) OR EXISTS(SELECT 1 FROM circle_members cm WHERE cm.circle_id = p.circle_id AND cm.user_id = ?))";
-    const params: any[] = [viewerId];
+    const isGlobalFilter = !options.postId && !options.userId && options.filter === 'global';
+    let whereClause = isGlobalFilter
+      ? "u.is_blocked = 0 AND (p.circle_id IS NULL OR (c.privacy = 'public' AND p.is_global = 1))"
+      : "u.is_blocked = 0 AND (p.circle_id IS NULL OR (c.privacy = 'public' AND p.is_global = 1) OR EXISTS(SELECT 1 FROM circle_members cm WHERE cm.circle_id = p.circle_id AND cm.user_id = ?))";
+    const params: any[] = isGlobalFilter ? [] : [viewerId];
 
     if (options.postId) {
       whereClause += ' AND p.id = ?';
@@ -1190,66 +1213,74 @@ async function bootstrap() {
     } else if (options.userId) {
       whereClause += ' AND p.user_id = ?';
       params.push(options.userId);
-    } else if (options.filter === 'global') {
-      whereClause += ` AND (p.circle_id IS NULL OR (c.privacy = 'public' AND p.is_global = 1)) AND (
+    } else if (isGlobalFilter) {
+      whereClause += ` AND (
         p.circle_id IN (SELECT circle_id FROM circle_members WHERE user_id = ?)
         OR p.user_id IN (SELECT following_id FROM follows WHERE follower_id = ?)
         OR p.user_id IN (
-          SELECT CASE WHEN requester_id = ? THEN receiver_id ELSE requester_id END
-          FROM connections WHERE status = 'accepted' AND (requester_id = ? OR receiver_id = ?)
+          SELECT receiver_id FROM connections WHERE status = 'accepted' AND requester_id = ?
+          UNION ALL
+          SELECT requester_id FROM connections WHERE status = 'accepted' AND receiver_id = ?
         )
-        OR u.is_verified = 1
+        OR (u.is_verified = 1 AND (p.circle_id IS NOT NULL OR u.profile_visibility = 'public'))
         OR p.user_id = ?
       )`;
-      params.push(viewerId, viewerId, viewerId, viewerId, viewerId, viewerId);
+      params.push(viewerId, viewerId, viewerId, viewerId, viewerId);
     } else if (options.filter === 'following') {
       whereClause +=
         ' AND (p.user_id = ? OR p.user_id IN (SELECT following_id FROM follows WHERE follower_id = ?) OR p.circle_id IN (SELECT circle_id FROM circle_members WHERE user_id = ?))';
       params.push(viewerId, viewerId, viewerId);
     } else if (options.filter === 'connections') {
       whereClause += ` AND (p.user_id = ? OR p.user_id IN (
-        SELECT CASE WHEN requester_id = ? THEN receiver_id ELSE requester_id END
-        FROM connections WHERE status = 'accepted' AND (requester_id = ? OR receiver_id = ?)
+        SELECT receiver_id FROM connections WHERE status = 'accepted' AND requester_id = ?
+        UNION ALL
+        SELECT requester_id FROM connections WHERE status = 'accepted' AND receiver_id = ?
       ))`;
-      params.push(viewerId, viewerId, viewerId, viewerId);
+      params.push(viewerId, viewerId, viewerId);
     }
 
     if (options.verifiedOnly && !options.postId) {
-      whereClause += ' AND u.is_verified = 1';
+      whereClause +=
+        " AND u.is_verified = 1 AND (p.circle_id IS NOT NULL OR u.profile_visibility = 'public' OR p.user_id = ?)";
+      params.push(viewerId);
     }
 
     const spotlightExpr =
-      '(p.is_boosted = 1 OR ((likes_count * 2 + comments_count * 2 + shares_count * 3) >= 4) OR p.views_count >= 25)';
+      '(s.is_boosted = 1 OR ((s.likes_count * 2 + s.comments_count * 2 + s.shares_count * 3) >= 4) OR s.views_count >= 25)';
 
     const orderClause =
       options.filter === 'popular'
-        ? 'ORDER BY (likes_count * 2 + comments_count * 2 + shares_count * 3) DESC, p.created_at DESC, p.id DESC'
+        ? 'ORDER BY (s.likes_count * 2 + s.comments_count * 2 + s.shares_count * 3) DESC, s.created_at DESC, s.id DESC'
         : options.filter === 'recent'
-        ? 'ORDER BY p.created_at DESC, p.id DESC'
-        : `ORDER BY CASE WHEN ${spotlightExpr} THEN 1 ELSE 0 END DESC, p.is_boosted DESC, p.created_at DESC, p.id DESC`;
+        ? 'ORDER BY s.created_at DESC, s.id DESC'
+        : `ORDER BY CASE WHEN ${spotlightExpr} THEN 1 ELSE 0 END DESC, s.is_boosted DESC, s.created_at DESC, s.id DESC`;
 
     const limitVal = Math.min(60, Math.max(1, Number(options.limit || 20)));
     const offsetVal = Math.max(0, Number(options.offset || 0));
 
     const rows = db
       .prepare(
-        `SELECT p.*, u.name as author_name, u.username as author_username, u.avatar_url as author_avatar, u.is_verified as author_verified,
-          c.name as circle_name, c.category as circle_category, c.privacy as circle_privacy, c.avatar_url as circle_avatar,
-          CASE WHEN p.circle_id IS NOT NULL THEN EXISTS(SELECT 1 FROM circle_members cm2 WHERE cm2.circle_id = p.circle_id AND cm2.user_id = ?) ELSE 0 END as circle_is_member,
-          CASE WHEN p.circle_id IS NOT NULL THEN (SELECT cm3.role FROM circle_members cm3 WHERE cm3.circle_id = p.circle_id AND cm3.user_id = ?) ELSE NULL END as circle_viewer_role,
-          (SELECT COUNT(*) FROM post_likes WHERE post_id = p.id) as likes_count,
-          (SELECT COUNT(*) FROM post_comments WHERE post_id = p.id) as comments_count,
-          (SELECT COUNT(*) FROM post_shares WHERE post_id = p.id) as shares_count,
-          EXISTS(SELECT 1 FROM post_likes WHERE post_id = p.id AND user_id = ?) as is_liked,
-          EXISTS(SELECT 1 FROM post_views WHERE post_id = p.id AND user_id = ?) as has_viewed
-         FROM posts p
-         JOIN users u ON u.id = p.user_id
-         LEFT JOIN circles c ON c.id = p.circle_id
-         WHERE ${whereClause}
+        `WITH scored_posts AS (
+           SELECT p.*, u.name as author_name, u.username as author_username, u.avatar_url as author_avatar, u.is_verified as author_verified,
+             c.name as circle_name, c.category as circle_category, c.privacy as circle_privacy, c.avatar_url as circle_avatar,
+             (SELECT COUNT(*) FROM post_likes WHERE post_id = p.id) as likes_count,
+             (SELECT COUNT(*) FROM post_comments WHERE post_id = p.id) as comments_count,
+             (SELECT COUNT(*) FROM post_shares WHERE post_id = p.id) as shares_count
+           FROM posts p
+           JOIN users u ON u.id = p.user_id
+           LEFT JOIN circles c ON c.id = p.circle_id
+           WHERE ${whereClause}
+         )
+         SELECT s.*,
+           CASE WHEN s.circle_id IS NOT NULL THEN EXISTS(SELECT 1 FROM circle_members cm2 WHERE cm2.circle_id = s.circle_id AND cm2.user_id = ?) ELSE 0 END as circle_is_member,
+           CASE WHEN s.circle_id IS NOT NULL THEN (SELECT cm3.role FROM circle_members cm3 WHERE cm3.circle_id = s.circle_id AND cm3.user_id = ?) ELSE NULL END as circle_viewer_role,
+           EXISTS(SELECT 1 FROM post_likes WHERE post_id = s.id AND user_id = ?) as is_liked,
+           EXISTS(SELECT 1 FROM post_views WHERE post_id = s.id AND user_id = ?) as has_viewed
+         FROM scored_posts s
          ${orderClause}
          LIMIT ? OFFSET ?`
       )
-      .all(viewerId, viewerId, viewerId, viewerId, ...params, limitVal, offsetVal) as any[];
+      .all(...params, viewerId, viewerId, viewerId, viewerId, limitVal, offsetVal) as any[];
 
     const commentsByPostId = new Map<number, any[]>();
     if (rows.length > 0) {
@@ -1403,9 +1434,9 @@ async function bootstrap() {
         return;
       }
       const post = db
-        .prepare('SELECT id, user_id, circle_id, circle_post_id FROM posts WHERE id = ?')
+        .prepare('SELECT id, user_id, circle_id, circle_post_id, media_url FROM posts WHERE id = ?')
         .get(postId) as
-        | { id: number; user_id: number; circle_id: number | null; circle_post_id: number | null }
+        | { id: number; user_id: number; circle_id: number | null; circle_post_id: number | null; media_url: string }
         | undefined;
       if (!post) {
         res.status(404).json({ error: 'Post not found.' });
@@ -1420,6 +1451,9 @@ async function bootstrap() {
       db.prepare('DELETE FROM posts WHERE id = ?').run(postId);
       if (post.circle_post_id) {
         db.prepare('DELETE FROM circle_posts WHERE id = ?').run(post.circle_post_id);
+      }
+      if (post.media_url) {
+        cleanupUnusedUploadFile(post.media_url);
       }
       res.json({ ok: true });
     } catch (err: any) {
@@ -1891,27 +1925,66 @@ async function bootstrap() {
       )
       .all(conversationId) as any[];
 
-    const reactionStmt = db.prepare(
-      `SELECT emoji, COUNT(*) as count, MAX(CASE WHEN user_id = ? THEN 1 ELSE 0 END) as user_reacted
-       FROM message_reactions WHERE message_id = ? GROUP BY emoji`
-    );
-    const replyStmt = db.prepare(
-      `SELECT m.id, m.content, m.media_type, m.is_unsent, u.name as sender_name
-       FROM messages m JOIN users u ON u.id = m.sender_id WHERE m.id = ?`
-    );
-    const seenStmt = db.prepare(
-      `SELECT COUNT(*) as c FROM conversation_members
-       WHERE conversation_id = ? AND user_id != ? AND last_read_at >= ?`
-    );
+    if (rows.length === 0) return [];
 
-    return rows.map((r) => {
-      const replyRow = r.reply_to_id ? (replyStmt.get(r.reply_to_id) as any) : null;
-      const reactions = (reactionStmt.all(viewerId, r.id) as any[]).map((rx) => ({
+    const msgIds = rows.map((r) => Number(r.id));
+    const msgPlaceholders = msgIds.map(() => '?').join(',');
+
+    // Batch-load reactions for all messages in this conversation (avoids N+1 queries)
+    const allReactions = db
+      .prepare(
+        `SELECT message_id, emoji, COUNT(*) as count, MAX(CASE WHEN user_id = ? THEN 1 ELSE 0 END) as user_reacted
+         FROM message_reactions
+         WHERE message_id IN (${msgPlaceholders})
+         GROUP BY message_id, emoji`
+      )
+      .all(viewerId, ...msgIds) as any[];
+
+    const reactionsByMsg = new Map<number, any[]>();
+    for (const rx of allReactions) {
+      const mid = Number(rx.message_id);
+      let list = reactionsByMsg.get(mid);
+      if (!list) {
+        list = [];
+        reactionsByMsg.set(mid, list);
+      }
+      list.push({
         emoji: rx.emoji,
         count: rx.count,
         user_reacted: Boolean(rx.user_reacted),
-      }));
-      const seenCount = (seenStmt.get(conversationId, r.sender_id, r.created_at) as { c: number }).c;
+      });
+    }
+
+    // Batch-load reply previews referenced by messages in this conversation
+    const replyIds = Array.from(
+      new Set(rows.map((r) => (r.reply_to_id ? Number(r.reply_to_id) : 0)).filter((id) => id > 0))
+    );
+    const replyById = new Map<number, any>();
+    if (replyIds.length > 0) {
+      const replyPlaceholders = replyIds.map(() => '?').join(',');
+      const replyRows = db
+        .prepare(
+          `SELECT m.id, m.content, m.media_type, m.is_unsent, u.name as sender_name
+           FROM messages m JOIN users u ON u.id = m.sender_id
+           WHERE m.id IN (${replyPlaceholders})`
+        )
+        .all(...replyIds) as any[];
+      for (const rr of replyRows) {
+        replyById.set(Number(rr.id), rr);
+      }
+    }
+
+    // Load conversation member read cursors once to compute seen_by_count in memory
+    const memberReadCursors = db
+      .prepare('SELECT user_id, last_read_at FROM conversation_members WHERE conversation_id = ?')
+      .all(conversationId) as { user_id: number; last_read_at: string }[];
+
+    return rows.map((r) => {
+      const replyRow = r.reply_to_id ? replyById.get(Number(r.reply_to_id)) : null;
+      const seenCount = memberReadCursors.reduce(
+        (acc, m) => (m.user_id !== r.sender_id && m.last_read_at >= r.created_at ? acc + 1 : acc),
+        0
+      );
 
       return {
         id: r.id,
@@ -1938,7 +2011,7 @@ async function bootstrap() {
         is_unsent: Boolean(r.is_unsent),
         is_forwarded: Boolean(r.is_forwarded),
         forwarded_from_name: r.forwarded_from_name || '',
-        reactions,
+        reactions: reactionsByMsg.get(Number(r.id)) || [],
         seen_by_count: seenCount,
         created_at: r.created_at,
       };
@@ -2792,6 +2865,10 @@ async function bootstrap() {
         });
       }
 
+      if (convRow.type === 'direct' && content.trim()) {
+        triggerCircleDirectMessageAutoReply(convId, req.userId!, content);
+      }
+
       res.status(201).json({ message: created });
     } catch (err: any) {
       res.status(400).json({ error: err?.message || 'Message blocked.' });
@@ -3356,6 +3433,83 @@ async function bootstrap() {
     sendAutomatedDirectMessage(circle.owner_id, newUserId, personalized);
   }
 
+  function triggerCircleDirectMessageAutoReply(convId: number, senderId: number, messageText: string): void {
+    try {
+      const linkedInquiry = db
+        .prepare(
+          `SELECT id, circle_id
+           FROM circle_inquiries
+           WHERE conversation_id = ? AND customer_id = ?
+           ORDER BY id DESC LIMIT 1`
+        )
+        .get(convId, senderId) as { id: number; circle_id: number } | undefined;
+      if (!linkedInquiry) return;
+
+      const circle = db
+        .prepare('SELECT id, name, owner_id FROM circles WHERE id = ?')
+        .get(linkedInquiry.circle_id) as { id: number; name: string; owner_id: number } | undefined;
+      if (!circle || circle.owner_id === senderId) return;
+
+      const senderRole = getCircleMemberRole(circle.id, senderId);
+      if (senderRole === 'owner' || senderRole === 'admin' || senderRole === 'moderator') return;
+
+      const settings = getOrEnsureCircleAutomationSettings(circle.id);
+      const lowerMsg = messageText.toLowerCase();
+      let autoReplyTemplate: string | null = null;
+
+      if (settings.auto_keyword_reply_enabled) {
+        const rules = db
+          .prepare('SELECT id, keyword, reply_text FROM circle_keyword_rules WHERE circle_id = ? AND is_active = 1 ORDER BY id ASC')
+          .all(circle.id) as { id: number; keyword: string; reply_text: string }[];
+        const matchedRule = rules.find((r) => lowerMsg.includes(String(r.keyword || '').trim().toLowerCase()));
+        if (matchedRule) {
+          db.prepare('UPDATE circle_keyword_rules SET hit_count = hit_count + 1 WHERE id = ?').run(matchedRule.id);
+          autoReplyTemplate = matchedRule.reply_text;
+        }
+      }
+
+      if (!autoReplyTemplate && settings.auto_inquiry_reply_enabled && settings.auto_inquiry_reply_message.trim()) {
+        // Avoid repeating generic inquiry reply if staff/owner already messaged within the last 5 minutes
+        const recentOwnerReply = db
+          .prepare(
+            `SELECT 1 FROM messages
+             WHERE conversation_id = ? AND sender_id = ? AND created_at >= datetime('now', '-5 minutes')
+             LIMIT 1`
+          )
+          .get(convId, circle.owner_id);
+        if (!recentOwnerReply) {
+          autoReplyTemplate = settings.auto_inquiry_reply_message;
+        }
+      }
+
+      if (!autoReplyTemplate) return;
+
+      const actor = db.prepare('SELECT name FROM users WHERE id = ?').get(senderId) as { name: string } | undefined;
+      const personalized = autoReplyTemplate
+        .replace(/\{\{\s*name\s*\}\}/gi, actor?.name || 'there')
+        .replace(/\{\{\s*circle\s*\}\}/gi, circle.name);
+
+      // Deduplicate identical auto-reply sent within the last 60 seconds
+      const duplicateRecent = db
+        .prepare(
+          `SELECT 1 FROM messages
+           WHERE conversation_id = ? AND sender_id = ? AND content = ? AND created_at >= datetime('now', '-60 seconds')
+           LIMIT 1`
+        )
+        .get(convId, circle.owner_id, personalized);
+      if (duplicateRecent) return;
+
+      sendAutomatedDirectMessage(circle.owner_id, senderId, personalized);
+      db.prepare(
+        `UPDATE circle_inquiries
+         SET status = 'in_progress', last_reply = ?, handled_by = ?, updated_at = datetime('now')
+         WHERE id = ?`
+      ).run(personalized, circle.owner_id, linkedInquiry.id);
+    } catch {
+      // Keep direct message send non-blocking if auto-reply encounters an issue
+    }
+  }
+
   function dispatchCirclePostToFollowersAndGlobal(circlePostId: number): {
     globalPostId: number | null;
     deliveredCount: number;
@@ -3518,7 +3672,7 @@ async function bootstrap() {
     if (!settings.auto_keyword_reply_enabled) return null;
 
     const rules = db
-      .prepare('SELECT * FROM circle_keyword_rules WHERE circle_id = ? ORDER BY id ASC')
+      .prepare('SELECT * FROM circle_keyword_rules WHERE circle_id = ? AND is_active = 1 ORDER BY id ASC')
       .all(circleId) as any[];
     const lowerText = commentContent.toLowerCase();
     const matched = rules.find((r) => lowerText.includes(String(r.keyword || '').trim().toLowerCase()));
@@ -3636,34 +3790,45 @@ async function bootstrap() {
     };
   }
 
-  function formatCirclePosts(circleId: number, viewerId: number, status: 'approved' | 'pending') {
-    const rows = db
+  function hydrateCirclePostRows(rows: any[]) {
+    if (rows.length === 0) return [];
+    const postIds = rows.map((r) => Number(r.id));
+    const placeholders = postIds.map(() => '?').join(',');
+    const allComments = db
       .prepare(
-        `SELECT p.*, u.name as author_name, u.username as author_username, u.avatar_url as author_avatar, u.is_verified as author_verified,
-          (SELECT COUNT(*) FROM circle_post_likes WHERE post_id = p.id) as likes_count,
-          (SELECT COUNT(*) FROM circle_post_comments WHERE post_id = p.id) as comments_count,
-          (SELECT COUNT(*) FROM circle_post_shares WHERE post_id = p.id) as shares_count,
-          EXISTS(SELECT 1 FROM circle_post_likes WHERE post_id = p.id AND user_id = ?) as is_liked,
-          EXISTS(SELECT 1 FROM circle_post_views WHERE post_id = p.id AND user_id = ?) as has_viewed
-         FROM circle_posts p
-         JOIN users u ON u.id = p.user_id
-         WHERE p.circle_id = ? AND p.status = ? AND u.is_blocked = 0
-         ORDER BY p.created_at DESC, p.id DESC
-         LIMIT 60`
+        `SELECT c.*, u.name as author_name, u.username as author_username, u.avatar_url as author_avatar, u.is_verified as author_verified
+         FROM circle_post_comments c
+         JOIN users u ON u.id = c.user_id
+         WHERE c.post_id IN (${placeholders}) AND u.is_blocked = 0
+         ORDER BY c.created_at ASC, c.id ASC`
       )
-      .all(viewerId, viewerId, circleId, status) as any[];
+      .all(...postIds) as any[];
 
-    const commentStmt = db.prepare(
-      `SELECT c.*, u.name as author_name, u.username as author_username, u.avatar_url as author_avatar, u.is_verified as author_verified
-       FROM circle_post_comments c
-       JOIN users u ON u.id = c.user_id
-       WHERE c.post_id = ? AND u.is_blocked = 0
-       ORDER BY c.created_at ASC, c.id ASC`
-    );
+    const commentsByPost = new Map<number, any[]>();
+    for (const c of allComments) {
+      const pid = Number(c.post_id);
+      let list = commentsByPost.get(pid);
+      if (!list) {
+        list = [];
+        commentsByPost.set(pid, list);
+      }
+      list.push({
+        ...c,
+        author_avatar: sanitizeMediaUrl(c.author_avatar),
+        author_verified: Boolean(c.author_verified),
+      });
+    }
 
     return rows.map((r) => ({
       id: r.id,
       circle_id: r.circle_id,
+      ...(r.circle_name !== undefined ? { circle_name: r.circle_name } : {}),
+      ...(r.circle_category !== undefined ? { circle_category: r.circle_category } : {}),
+      ...(r.circle_privacy !== undefined
+        ? { circle_privacy: r.circle_privacy === 'private' ? 'private' : 'public' }
+        : {}),
+      ...(r.circle_avatar !== undefined ? { circle_avatar: sanitizeMediaUrl(r.circle_avatar) } : {}),
+      ...(r.circle_viewer_role !== undefined ? { circle_viewer_role: r.circle_viewer_role } : {}),
       user_id: r.user_id,
       author_name: r.author_name,
       author_username: r.author_username,
@@ -3682,13 +3847,29 @@ async function bootstrap() {
       is_global: Boolean(r.is_global ?? 1),
       global_post_id: r.global_post_id ? Number(r.global_post_id) : null,
       delivered_count: Number(r.delivered_count || 0),
-      comments: (commentStmt.all(r.id) as any[]).map((c) => ({
-        ...c,
-        author_avatar: sanitizeMediaUrl(c.author_avatar),
-        author_verified: Boolean(c.author_verified),
-      })),
+      comments: commentsByPost.get(Number(r.id)) || [],
       created_at: r.created_at,
     }));
+  }
+
+  function formatCirclePosts(circleId: number, viewerId: number, status: 'approved' | 'pending') {
+    const rows = db
+      .prepare(
+        `SELECT p.*, u.name as author_name, u.username as author_username, u.avatar_url as author_avatar, u.is_verified as author_verified,
+          (SELECT COUNT(*) FROM circle_post_likes WHERE post_id = p.id) as likes_count,
+          (SELECT COUNT(*) FROM circle_post_comments WHERE post_id = p.id) as comments_count,
+          (SELECT COUNT(*) FROM circle_post_shares WHERE post_id = p.id) as shares_count,
+          EXISTS(SELECT 1 FROM circle_post_likes WHERE post_id = p.id AND user_id = ?) as is_liked,
+          EXISTS(SELECT 1 FROM circle_post_views WHERE post_id = p.id AND user_id = ?) as has_viewed
+         FROM circle_posts p
+         JOIN users u ON u.id = p.user_id
+         WHERE p.circle_id = ? AND p.status = ? AND u.is_blocked = 0
+         ORDER BY p.created_at DESC, p.id DESC
+         LIMIT 60`
+      )
+      .all(viewerId, viewerId, circleId, status) as any[];
+
+    return hydrateCirclePostRows(rows);
   }
 
   app.get('/api/circles', requireAuth, (req: AuthedRequest, res) => {
@@ -3762,6 +3943,60 @@ async function bootstrap() {
       res.status(201).json({ circle: formatCircleRow(row, req.userId!) });
     } catch (err: any) {
       res.status(400).json({ error: err?.message || 'Could not create Circle.' });
+    }
+  });
+
+  app.get('/api/circles/feed/aggregated', requireAuth, (req: AuthedRequest, res) => {
+    try {
+      const rawLimit = Number(req.query.limit);
+      const limit = Number.isFinite(rawLimit) && rawLimit > 0 ? Math.min(40, Math.floor(rawLimit)) : 15;
+      const rawOffset = Number(req.query.offset);
+      const offset = Number.isFinite(rawOffset) && rawOffset >= 0 ? Math.floor(rawOffset) : 0;
+
+      const rows = db
+        .prepare(
+          `WITH scored_circle_posts AS (
+             SELECT
+               p.*,
+               c.name as circle_name,
+               c.category as circle_category,
+               c.privacy as circle_privacy,
+               c.avatar_url as circle_avatar,
+               cm.role as circle_viewer_role,
+               u.name as author_name,
+               u.username as author_username,
+               u.avatar_url as author_avatar,
+               u.is_verified as author_verified,
+               (SELECT COUNT(*) FROM circle_post_likes WHERE post_id = p.id) as likes_count,
+               (SELECT COUNT(*) FROM circle_post_comments WHERE post_id = p.id) as comments_count,
+               (SELECT COUNT(*) FROM circle_post_shares WHERE post_id = p.id) as shares_count
+             FROM circle_members cm
+             JOIN circle_posts p ON p.circle_id = cm.circle_id AND p.status = 'approved'
+             JOIN circles c ON c.id = p.circle_id
+             JOIN users u ON u.id = p.user_id
+             JOIN users co ON co.id = c.owner_id
+             WHERE cm.user_id = ? AND u.is_blocked = 0 AND co.is_blocked = 0
+           )
+           SELECT s.*,
+             EXISTS(SELECT 1 FROM circle_post_likes WHERE post_id = s.id AND user_id = ?) as is_liked,
+             EXISTS(SELECT 1 FROM circle_post_views WHERE post_id = s.id AND user_id = ?) as has_viewed
+           FROM scored_circle_posts s
+           ORDER BY (
+             (s.likes_count * 2 + s.comments_count * 3 + s.shares_count * 4 + MIN(s.views_count, 50) * 0.1)
+             - ((julianday('now') - julianday(s.created_at)) * 3.0)
+           ) DESC, s.created_at DESC, s.id DESC
+           LIMIT ? OFFSET ?`
+        )
+        .all(req.userId, req.userId, req.userId, limit + 1, offset) as any[];
+
+      const hasMore = rows.length > limit;
+      const pageRows = hasMore ? rows.slice(0, limit) : rows;
+      res.json({
+        posts: hydrateCirclePostRows(pageRows),
+        hasMore,
+      });
+    } catch (err: any) {
+      res.status(500).json({ error: err?.message || 'Could not load aggregated Circles feed.' });
     }
   });
 
@@ -4098,6 +4333,7 @@ async function bootstrap() {
         circleId,
         `You were invited to ${circle.name} as ${requestedRole}`
       );
+      triggerCircleAutoWelcome(circleId, target.id);
 
       res.status(201).json({ ok: true, user_id: target.id, role: requestedRole });
     } catch (err: any) {
@@ -4355,8 +4591,10 @@ async function bootstrap() {
         return;
       }
       const post = db
-        .prepare('SELECT id, user_id, global_post_id FROM circle_posts WHERE id = ? AND circle_id = ?')
-        .get(postId, circleId) as { id: number; user_id: number; global_post_id: number | null } | undefined;
+        .prepare('SELECT id, user_id, global_post_id, media_url FROM circle_posts WHERE id = ? AND circle_id = ?')
+        .get(postId, circleId) as
+        | { id: number; user_id: number; global_post_id: number | null; media_url: string }
+        | undefined;
       if (!post) {
         res.status(404).json({ error: 'Circle post not found.' });
         return;
@@ -4376,6 +4614,9 @@ async function bootstrap() {
       db.prepare('DELETE FROM circle_posts WHERE id = ?').run(postId);
       if (post.global_post_id) {
         db.prepare('DELETE FROM posts WHERE id = ?').run(post.global_post_id);
+      }
+      if (post.media_url) {
+        cleanupUnusedUploadFile(post.media_url);
       }
       res.json({ ok: true });
     } catch (err: any) {
@@ -4597,6 +4838,7 @@ async function bootstrap() {
       ).map((r) => ({
         ...r,
         create_inquiry: Boolean(r.create_inquiry),
+        is_active: Boolean(r.is_active ?? 1),
       }));
 
       const quickReplies = db
@@ -4771,6 +5013,7 @@ async function bootstrap() {
       const keyword = sanitizePlainText(req.body?.keyword || '', 40).toLowerCase();
       const replyText = sanitizePlainText(req.body?.reply_text || '', 2000);
       const createInquiry = req.body?.create_inquiry === false ? 0 : 1;
+      const isActive = req.body?.is_active === false ? 0 : 1;
 
       const kwCheck = validateTextField(keyword, 'Keyword', { required: true, maxWords: 5 });
       if (!kwCheck.valid) {
@@ -4785,16 +5028,103 @@ async function bootstrap() {
 
       const result = db
         .prepare(
-          'INSERT INTO circle_keyword_rules (circle_id, keyword, reply_text, create_inquiry) VALUES (?, ?, ?, ?)'
+          'INSERT INTO circle_keyword_rules (circle_id, keyword, reply_text, create_inquiry, is_active) VALUES (?, ?, ?, ?, ?)'
         )
-        .run(circleId, keyword, replyText, createInquiry);
+        .run(circleId, keyword, replyText, createInquiry, isActive);
       const created = db
         .prepare('SELECT * FROM circle_keyword_rules WHERE id = ?')
         .get(result.lastInsertRowid) as any;
 
-      res.status(201).json({ rule: { ...created, create_inquiry: Boolean(created.create_inquiry) } });
+      res.status(201).json({
+        rule: {
+          ...created,
+          create_inquiry: Boolean(created.create_inquiry),
+          is_active: Boolean(created.is_active ?? 1),
+        },
+      });
     } catch (err: any) {
       res.status(400).json({ error: err?.message || 'Could not add keyword rule.' });
+    }
+  });
+
+  app.patch('/api/circles/:id/automation/keywords/:ruleId', requireAuth, (req: AuthedRequest, res) => {
+    try {
+      const circleId = parsePositiveInt(req.params.id);
+      const ruleId = parsePositiveInt(req.params.ruleId);
+      if (!circleId || !ruleId) {
+        res.status(400).json({ error: 'Invalid identifier.' });
+        return;
+      }
+      const actorRole = getCircleMemberRole(circleId, req.userId!);
+      if (actorRole !== 'owner' && actorRole !== 'admin') {
+        res.status(403).json({ error: 'Only Circle owners and admins can edit keyword rules.' });
+        return;
+      }
+
+      const existing = db
+        .prepare('SELECT * FROM circle_keyword_rules WHERE id = ? AND circle_id = ?')
+        .get(ruleId, circleId) as any;
+      if (!existing) {
+        res.status(404).json({ error: 'Keyword rule not found.' });
+        return;
+      }
+
+      const nextKeyword =
+        req.body?.keyword !== undefined
+          ? sanitizePlainText(req.body.keyword, 40).toLowerCase()
+          : String(existing.keyword || '').toLowerCase();
+      const nextReplyText =
+        req.body?.reply_text !== undefined
+          ? sanitizePlainText(req.body.reply_text, 2000)
+          : String(existing.reply_text || '');
+      const nextCreateInquiry =
+        req.body?.create_inquiry !== undefined
+          ? req.body.create_inquiry
+            ? 1
+            : 0
+          : existing.create_inquiry
+          ? 1
+          : 0;
+      const nextIsActive =
+        req.body?.is_active !== undefined
+          ? req.body.is_active
+            ? 1
+            : 0
+          : Number(existing.is_active ?? 1)
+          ? 1
+          : 0;
+
+      const kwCheck = validateTextField(nextKeyword, 'Keyword', { required: true, maxWords: 5 });
+      if (!kwCheck.valid) {
+        res.status(400).json({ error: kwCheck.error });
+        return;
+      }
+      const replyCheck = validateTextField(nextReplyText, 'Auto-Reply Message', {
+        required: true,
+        maxWords: MAX_WORDS,
+      });
+      if (!replyCheck.valid) {
+        res.status(400).json({ error: replyCheck.error });
+        return;
+      }
+
+      db.prepare(
+        'UPDATE circle_keyword_rules SET keyword = ?, reply_text = ?, create_inquiry = ?, is_active = ? WHERE id = ? AND circle_id = ?'
+      ).run(nextKeyword, nextReplyText, nextCreateInquiry, nextIsActive, ruleId, circleId);
+
+      const updated = db
+        .prepare('SELECT * FROM circle_keyword_rules WHERE id = ?')
+        .get(ruleId) as any;
+
+      res.json({
+        rule: {
+          ...updated,
+          create_inquiry: Boolean(updated.create_inquiry),
+          is_active: Boolean(updated.is_active ?? 1),
+        },
+      });
+    } catch (err: any) {
+      res.status(400).json({ error: err?.message || 'Could not update keyword rule.' });
     }
   });
 
@@ -4851,6 +5181,61 @@ async function bootstrap() {
       res.status(201).json({ quick_reply: quickReply });
     } catch (err: any) {
       res.status(400).json({ error: err?.message || 'Could not save quick reply.' });
+    }
+  });
+
+  app.patch('/api/circles/:id/automation/quick-replies/:replyId', requireAuth, (req: AuthedRequest, res) => {
+    try {
+      const circleId = parsePositiveInt(req.params.id);
+      const replyId = parsePositiveInt(req.params.replyId);
+      if (!circleId || !replyId) {
+        res.status(400).json({ error: 'Invalid identifier.' });
+        return;
+      }
+      const actorRole = getCircleMemberRole(circleId, req.userId!);
+      if (!actorRole || !['owner', 'admin', 'moderator'].includes(actorRole)) {
+        res.status(403).json({ error: 'Only Circle staff can edit quick replies.' });
+        return;
+      }
+
+      const existing = db
+        .prepare('SELECT * FROM circle_quick_replies WHERE id = ? AND circle_id = ?')
+        .get(replyId, circleId) as any;
+      if (!existing) {
+        res.status(404).json({ error: 'Quick reply template not found.' });
+        return;
+      }
+
+      const nextTitle =
+        req.body?.title !== undefined
+          ? sanitizePlainText(req.body.title, 60)
+          : String(existing.title || '');
+      const nextContent =
+        req.body?.content !== undefined
+          ? sanitizePlainText(req.body.content, 2000)
+          : String(existing.content || '');
+
+      const titleCheck = validateTextField(nextTitle, 'Template Title', { required: true, maxWords: 12 });
+      if (!titleCheck.valid) {
+        res.status(400).json({ error: titleCheck.error });
+        return;
+      }
+      const contentCheck = validateTextField(nextContent, 'Template Message', {
+        required: true,
+        maxWords: MAX_WORDS,
+      });
+      if (!contentCheck.valid) {
+        res.status(400).json({ error: contentCheck.error });
+        return;
+      }
+
+      db.prepare(
+        'UPDATE circle_quick_replies SET title = ?, content = ? WHERE id = ? AND circle_id = ?'
+      ).run(nextTitle, nextContent, replyId, circleId);
+      const updated = db.prepare('SELECT * FROM circle_quick_replies WHERE id = ?').get(replyId);
+      res.json({ quick_reply: updated });
+    } catch (err: any) {
+      res.status(400).json({ error: err?.message || 'Could not update quick reply.' });
     }
   });
 
@@ -4949,7 +5334,7 @@ async function bootstrap() {
 
       if (settings.auto_keyword_reply_enabled) {
         const rules = db
-          .prepare('SELECT id, keyword, reply_text FROM circle_keyword_rules WHERE circle_id = ?')
+          .prepare('SELECT id, keyword, reply_text FROM circle_keyword_rules WHERE circle_id = ? AND is_active = 1 ORDER BY id ASC')
           .all(circleId) as { id: number; keyword: string; reply_text: string }[];
         const matchedRule = rules.find((r) => lowerMsg.includes(r.keyword.toLowerCase()));
         if (matchedRule) {
@@ -5471,6 +5856,270 @@ async function bootstrap() {
     }
   });
 
+  function describeReportTarget(targetType: string, targetId: number) {
+    let targetOwnerId: number | null = null;
+    let targetName = '';
+    let targetUsername = '';
+    let targetAvatar = '';
+    let targetSummary = `${targetType} #${targetId}`;
+
+    if (targetType === 'post') {
+      const p = db
+        .prepare(
+          'SELECT p.content, u.id as owner_id, u.name, u.username, u.avatar_url FROM posts p JOIN users u ON u.id = p.user_id WHERE p.id = ?'
+        )
+        .get(targetId) as any;
+      if (p) {
+        targetOwnerId = p.owner_id;
+        targetName = p.name;
+        targetUsername = p.username;
+        targetAvatar = p.avatar_url || '';
+        const snippet = String(p.content || '').slice(0, 80);
+        targetSummary = snippet ? `Post: "${snippet}${p.content.length > 80 ? '...' : ''}"` : 'Image Post';
+      } else {
+        targetSummary = 'Deleted post';
+      }
+    } else if (targetType === 'circle_post') {
+      const cp = db
+        .prepare(
+          'SELECT p.content, u.id as owner_id, u.name, u.username, u.avatar_url FROM circle_posts p JOIN users u ON u.id = p.user_id WHERE p.id = ?'
+        )
+        .get(targetId) as any;
+      if (cp) {
+        targetOwnerId = cp.owner_id;
+        targetName = cp.name;
+        targetUsername = cp.username;
+        targetAvatar = cp.avatar_url || '';
+        const snippet = String(cp.content || '').slice(0, 80);
+        targetSummary = snippet
+          ? `Circle Post: "${snippet}${cp.content.length > 80 ? '...' : ''}"`
+          : 'Circle Image Post';
+      } else {
+        targetSummary = 'Deleted Circle post';
+      }
+    } else if (targetType === 'video') {
+      const v = db
+        .prepare(
+          'SELECT v.title, u.id as owner_id, u.name, u.username, u.avatar_url FROM videos v JOIN users u ON u.id = v.uploader_id WHERE v.id = ?'
+        )
+        .get(targetId) as any;
+      if (v) {
+        targetOwnerId = v.owner_id;
+        targetName = v.name;
+        targetUsername = v.username;
+        targetAvatar = v.avatar_url || '';
+        targetSummary = `Video: "${v.title}"`;
+      } else {
+        targetSummary = 'Deleted video';
+      }
+    } else if (targetType === 'user') {
+      const u = db
+        .prepare('SELECT id as owner_id, name, username, avatar_url FROM users WHERE id = ?')
+        .get(targetId) as any;
+      if (u) {
+        targetOwnerId = u.owner_id;
+        targetName = u.name;
+        targetUsername = u.username;
+        targetAvatar = u.avatar_url || '';
+        targetSummary = `Profile: ${u.name} (@${u.username})`;
+      } else {
+        targetSummary = 'Deleted account';
+      }
+    } else if (targetType === 'group') {
+      const g = db
+        .prepare(
+          'SELECT c.name as group_name, u.id as owner_id, u.name, u.username, u.avatar_url FROM conversations c JOIN users u ON u.id = c.created_by WHERE c.id = ?'
+        )
+        .get(targetId) as any;
+      if (g) {
+        targetOwnerId = g.owner_id;
+        targetName = g.name;
+        targetUsername = g.username;
+        targetAvatar = g.avatar_url || '';
+        targetSummary = `Group: "${g.group_name}"`;
+      } else {
+        targetSummary = 'Deleted group';
+      }
+    }
+
+    return {
+      targetOwnerId,
+      targetName,
+      targetUsername,
+      targetAvatar,
+      targetSummary,
+    };
+  }
+
+  app.get('/api/reports/my-activity', requireAuth, (req: AuthedRequest, res) => {
+    try {
+      const userId = req.userId!;
+
+      const givenRows = db
+        .prepare(
+          `SELECT id, case_id, target_type, target_id, reason, status, created_at
+           FROM reports
+           WHERE reporter_id = ?
+           ORDER BY created_at DESC, id DESC
+           LIMIT 100`
+        )
+        .all(userId) as any[];
+
+      const reportsGiven = givenRows.map((row) => {
+        const info = describeReportTarget(row.target_type, row.target_id);
+        return {
+          id: row.id,
+          case_id: row.case_id || `HTV-CASE-${100000 + row.id}`,
+          target_type: row.target_type,
+          target_id: row.target_id,
+          target_name: info.targetName,
+          target_username: info.targetUsername,
+          target_avatar: info.targetAvatar,
+          target_summary: info.targetSummary,
+          reason: row.reason,
+          status: row.status,
+          created_at: row.created_at,
+        };
+      });
+
+      const receivedRows = db
+        .prepare(
+          `SELECT r.id, r.case_id, r.target_type, r.target_id, r.reason, r.status, r.created_at
+           FROM reports r
+           WHERE (r.target_type = 'user' AND r.target_id = ?)
+              OR (r.target_type = 'post' AND EXISTS (SELECT 1 FROM posts p WHERE p.id = r.target_id AND p.user_id = ?))
+              OR (r.target_type = 'circle_post' AND EXISTS (SELECT 1 FROM circle_posts cp WHERE cp.id = r.target_id AND cp.user_id = ?))
+              OR (r.target_type = 'video' AND EXISTS (SELECT 1 FROM videos v WHERE v.id = r.target_id AND v.uploader_id = ?))
+              OR (r.target_type = 'group' AND EXISTS (SELECT 1 FROM conversations c WHERE c.id = r.target_id AND c.created_by = ?))
+           ORDER BY r.created_at DESC, r.id DESC
+           LIMIT 100`
+        )
+        .all(userId, userId, userId, userId, userId) as any[];
+
+      const reportsReceived = receivedRows.map((row) => {
+        const info = describeReportTarget(row.target_type, row.target_id);
+        return {
+          id: row.id,
+          case_id: row.case_id || `HTV-CASE-${100000 + row.id}`,
+          target_type: row.target_type,
+          target_id: row.target_id,
+          target_name: info.targetName,
+          target_username: info.targetUsername,
+          target_avatar: info.targetAvatar,
+          target_summary: info.targetSummary,
+          reason: row.reason,
+          status: row.status,
+          created_at: row.created_at,
+        };
+      });
+
+      const summary = {
+        received_count: reportsReceived.length,
+        given_count: reportsGiven.length,
+        pending_received: reportsReceived.filter((r) => r.status === 'pending').length,
+        resolved_received: reportsReceived.filter((r) => r.status === 'resolved').length,
+        pending_given: reportsGiven.filter((r) => r.status === 'pending').length,
+      };
+
+      if (req.userRole === 'admin') {
+        const allReports = db
+          .prepare(
+            `SELECT r.*, u.name as reporter_name, u.username as reporter_username
+             FROM reports r
+             JOIN users u ON u.id = r.reporter_id
+             ORDER BY r.created_at DESC, r.id DESC
+             LIMIT 150`
+          )
+          .all() as any[];
+
+        const perUserMap = new Map<
+          number,
+          { received_count: number; given_count: number; pending_received: number }
+        >();
+        const ensureUserStats = (uid: number) => {
+          let entry = perUserMap.get(uid);
+          if (!entry) {
+            entry = { received_count: 0, given_count: 0, pending_received: 0 };
+            perUserMap.set(uid, entry);
+          }
+          return entry;
+        };
+
+        const communityCases = allReports.map((rep) => {
+          const info = describeReportTarget(rep.target_type, rep.target_id);
+          ensureUserStats(rep.reporter_id).given_count += 1;
+          if (info.targetOwnerId) {
+            const targetStats = ensureUserStats(info.targetOwnerId);
+            targetStats.received_count += 1;
+            if (rep.status === 'pending') targetStats.pending_received += 1;
+          }
+          return {
+            id: rep.id,
+            case_id: rep.case_id || `HTV-CASE-${100000 + rep.id}`,
+            reporter_id: rep.reporter_id,
+            reporter_name: rep.reporter_name,
+            reporter_username: rep.reporter_username,
+            target_type: rep.target_type,
+            target_id: rep.target_id,
+            target_name: info.targetName,
+            target_username: info.targetUsername,
+            target_summary: info.targetSummary,
+            reason: rep.reason,
+            status: rep.status,
+            created_at: rep.created_at,
+          };
+        });
+
+        const involvedIds = Array.from(perUserMap.keys());
+        const communitySummary: any[] = [];
+        if (involvedIds.length > 0) {
+          const placeholders = involvedIds.map(() => '?').join(',');
+          const userRows = db
+            .prepare(
+              `SELECT id, name, username, avatar_url, is_verified FROM users WHERE id IN (${placeholders})`
+            )
+            .all(...involvedIds) as any[];
+          for (const u of userRows) {
+            const st = perUserMap.get(u.id)!;
+            communitySummary.push({
+              user_id: u.id,
+              name: u.name,
+              username: u.username,
+              avatar_url: u.avatar_url || '',
+              is_verified: Boolean(u.is_verified),
+              received_count: st.received_count,
+              given_count: st.given_count,
+              pending_received: st.pending_received,
+            });
+          }
+          communitySummary.sort(
+            (a, b) =>
+              b.received_count - a.received_count ||
+              b.given_count - a.given_count ||
+              a.name.localeCompare(b.name)
+          );
+        }
+
+        res.json({
+          summary,
+          reports_received: reportsReceived,
+          reports_given: reportsGiven,
+          community_summary: communitySummary,
+          community_cases: communityCases.slice(0, 60),
+        });
+        return;
+      }
+
+      res.json({
+        summary,
+        reports_received: reportsReceived,
+        reports_given: reportsGiven,
+      });
+    } catch (err: any) {
+      res.status(500).json({ error: err?.message || 'Could not load report activity.' });
+    }
+  });
+
   // ─────────────────────────────────────────────────────────────
   // ADMIN DASHBOARD ROUTES (Protected by requireAdmin)
   // ─────────────────────────────────────────────────────────────
@@ -5682,6 +6331,327 @@ async function bootstrap() {
       db.prepare("UPDATE reports SET status = 'dismissed' WHERE id = ?").run(reportId);
     }
     res.json({ ok: true });
+  });
+
+  // ─────────────────────────────────────────────────────────────
+  // SUPPORTBOX & TELEGRAM SUPPORT ROUTES
+  // ─────────────────────────────────────────────────────────────
+  const SUPPORT_CATEGORIES = new Set([
+    'bug_error',
+    'crash_performance',
+    'account_access',
+    'feature_request',
+    'safety_policy',
+    'other',
+  ]);
+  const SUPPORT_STATUSES = new Set(['submitted', 'in_review', 'resolved', 'closed']);
+  const supportRateBuckets = new Map<number, number[]>();
+  const SUPPORT_WINDOW_MS = 10 * 60 * 1000;
+  const SUPPORT_MAX_PER_WINDOW = 6;
+
+  function normalizeTelegramHandleInput(raw: unknown): { valid: boolean; handle: string; error?: string } {
+    const trimmed = typeof raw === 'string' ? raw.trim() : '';
+    if (!trimmed) return { valid: true, handle: '' };
+    let cleaned = trimmed
+      .replace(/^https?:\/\/(www\.)?(t\.me|telegram\.me)\//i, '')
+      .replace(/^(t\.me|telegram\.me)\//i, '')
+      .replace(/^@+/, '')
+      .split(/[/?#]/)[0]
+      .trim();
+    if (!/^[a-zA-Z0-9_]{3,64}$/.test(cleaned)) {
+      return {
+        valid: false,
+        handle: '',
+        error: 'Telegram username must be 3–64 letters, numbers, or underscores (e.g. @HushTalkSupport).',
+      };
+    }
+    return { valid: true, handle: cleaned };
+  }
+
+  function getSupportConfig() {
+    const row = db
+      .prepare("SELECT value FROM app_settings WHERE key = 'telegram_support_handle'")
+      .get() as { value: string } | undefined;
+    const rawSetting = row?.value || process.env.TELEGRAM_SUPPORT_HANDLE || '';
+    const parsed = normalizeTelegramHandleInput(rawSetting);
+    const cleanHandle = parsed.valid ? parsed.handle : '';
+    const botConfigured = Boolean(
+      (process.env.TELEGRAM_BOT_TOKEN || '').trim() && (process.env.TELEGRAM_CHAT_ID || '').trim()
+    );
+    return {
+      telegram_handle: cleanHandle ? `@${cleanHandle}` : '',
+      telegram_url: cleanHandle ? `https://t.me/${cleanHandle}` : '',
+      telegram_bot_configured: botConfigured,
+      app_version: '2.4.0',
+    };
+  }
+
+  async function forwardSupportTicketToTelegram(ticket: {
+    ticket_id: string;
+    category: string;
+    affected_area: string;
+    subject: string;
+    description: string;
+    device_info: string;
+    reporter_name: string;
+    reporter_username: string;
+  }): Promise<boolean> {
+    const botToken = (process.env.TELEGRAM_BOT_TOKEN || '').trim();
+    const chatId = (process.env.TELEGRAM_CHAT_ID || '').trim();
+    if (!botToken || !chatId) return false;
+
+    const lines = [
+      `HushTalkVoice SupportBox [${ticket.ticket_id}]`,
+      `From: ${ticket.reporter_name} (@${ticket.reporter_username})`,
+      `Category: ${ticket.category} | Area: ${ticket.affected_area}`,
+      `Subject: ${ticket.subject}`,
+      `Details: ${ticket.description.slice(0, 1200)}`,
+      ticket.device_info ? `Device: ${ticket.device_info}` : '',
+    ].filter(Boolean);
+
+    try {
+      const resp = await fetch(`https://api.telegram.org/bot${botToken}/sendMessage`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          chat_id: chatId,
+          text: lines.join('\n'),
+        }),
+        signal: AbortSignal.timeout(5000),
+      });
+      return resp.ok;
+    } catch {
+      return false;
+    }
+  }
+
+  function formatSupportTicketRow(row: any) {
+    return {
+      ...row,
+      telegram_forwarded: Boolean(row.telegram_forwarded),
+    };
+  }
+
+  app.get('/api/support/config', requireAuth, (_req, res) => {
+    res.json(getSupportConfig());
+  });
+
+  app.get('/api/support/tickets', requireAuth, (req: AuthedRequest, res) => {
+    const rows = db
+      .prepare(
+        `SELECT t.*, h.name as handled_by_name
+         FROM support_tickets t
+         LEFT JOIN users h ON h.id = t.handled_by
+         WHERE t.user_id = ?
+         ORDER BY t.id DESC
+         LIMIT 50`
+      )
+      .all(req.userId!) as any[];
+    res.json({ tickets: rows.map(formatSupportTicketRow) });
+  });
+
+  app.post('/api/support/tickets', requireAuth, async (req: AuthedRequest, res) => {
+    try {
+      const userId = req.userId!;
+      const category = String(req.body?.category || 'bug_error').trim();
+      const affectedArea = sanitizePlainText(req.body?.affected_area || 'general', 50) || 'general';
+      const subject = sanitizePlainText(req.body?.subject || '', 140);
+      const description = sanitizePlainText(req.body?.description || '', 2500);
+      const rawScreenshot = sanitizeMediaUrl(req.body?.screenshot_url || '');
+      const screenshotUrl = rawScreenshot.startsWith('/uploads/') ? rawScreenshot : '';
+      const deviceInfo = sanitizePlainText(req.body?.device_info || '', 300);
+
+      if (!SUPPORT_CATEGORIES.has(category)) {
+        res.status(400).json({ error: 'Invalid issue category selected.' });
+        return;
+      }
+      if (subject.length < 3) {
+        res.status(400).json({ error: 'Please enter a short summary (at least 3 characters).' });
+        return;
+      }
+      if (description.length < 10) {
+        res.status(400).json({ error: 'Please describe what happened (at least 10 characters).' });
+        return;
+      }
+
+      // Sliding-window rate limit
+      const now = Date.now();
+      const recent = (supportRateBuckets.get(userId) || []).filter(
+        (ts) => now - ts < SUPPORT_WINDOW_MS
+      );
+      if (recent.length >= SUPPORT_MAX_PER_WINDOW) {
+        supportRateBuckets.set(userId, recent);
+        res.status(429).json({
+          error: 'Too many SupportBox applications submitted recently. Please wait a few minutes or message us on Telegram.',
+        });
+        return;
+      }
+      recent.push(now);
+      supportRateBuckets.set(userId, recent);
+      if (supportRateBuckets.size > 1000) {
+        for (const [uid, times] of supportRateBuckets.entries()) {
+          if (times.every((ts) => now - ts >= SUPPORT_WINDOW_MS)) {
+            supportRateBuckets.delete(uid);
+          }
+        }
+      }
+
+      const ticketCode = `HTV-SUP-${crypto.randomInt(100000, 999999)}`;
+      const insertResult = db
+        .prepare(
+          `INSERT INTO support_tickets
+           (ticket_id, user_id, category, affected_area, subject, description, screenshot_url, device_info)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
+        )
+        .run(ticketCode, userId, category, affectedArea, subject, description, screenshotUrl, deviceInfo);
+
+      const createdId = Number(insertResult.lastInsertRowid);
+      const userRow = db
+        .prepare('SELECT name, username FROM users WHERE id = ?')
+        .get(userId) as { name: string; username: string } | undefined;
+
+      const forwarded = await forwardSupportTicketToTelegram({
+        ticket_id: ticketCode,
+        category,
+        affected_area: affectedArea,
+        subject,
+        description,
+        device_info: deviceInfo,
+        reporter_name: userRow?.name || 'Member',
+        reporter_username: userRow?.username || String(userId),
+      });
+
+      if (forwarded) {
+        db.prepare('UPDATE support_tickets SET telegram_forwarded = 1 WHERE id = ?').run(createdId);
+      }
+
+      // Notify admins in-app
+      const admins = db
+        .prepare("SELECT id FROM users WHERE role = 'admin' AND is_blocked = 0 AND id != ?")
+        .all(userId) as { id: number }[];
+      for (const admin of admins) {
+        createNotification(
+          admin.id,
+          userId,
+          'support_ticket',
+          createdId,
+          `submitted SupportBox ticket ${ticketCode}: ${subject.slice(0, 60)}`
+        );
+      }
+
+      const ticket = db
+        .prepare(
+          `SELECT t.*, h.name as handled_by_name
+           FROM support_tickets t
+           LEFT JOIN users h ON h.id = t.handled_by
+           WHERE t.id = ?`
+        )
+        .get(createdId);
+
+      res.status(201).json({ ticket: formatSupportTicketRow(ticket) });
+    } catch (err: any) {
+      res.status(500).json({ error: err?.message || 'Could not submit SupportBox application.' });
+    }
+  });
+
+  app.get('/api/admin/support', requireAuth, requireAdmin, (_req, res) => {
+    const rows = db
+      .prepare(
+        `SELECT t.*,
+                u.name as user_name, u.username as user_username, u.avatar_url as user_avatar, u.email as user_email,
+                h.name as handled_by_name
+         FROM support_tickets t
+         JOIN users u ON u.id = t.user_id
+         LEFT JOIN users h ON h.id = t.handled_by
+         ORDER BY CASE WHEN t.status IN ('submitted', 'in_review') THEN 0 ELSE 1 END, t.id DESC
+         LIMIT 200`
+      )
+      .all() as any[];
+
+    res.json({
+      tickets: rows.map(formatSupportTicketRow),
+      config: getSupportConfig(),
+    });
+  });
+
+  app.patch('/api/admin/support/:id', requireAuth, requireAdmin, (req: AuthedRequest, res) => {
+    const ticketDbId = parsePositiveInt(req.params.id);
+    if (!ticketDbId) {
+      res.status(400).json({ error: 'Invalid ticket ID.' });
+      return;
+    }
+
+    const existing = db.prepare('SELECT * FROM support_tickets WHERE id = ?').get(ticketDbId) as any;
+    if (!existing) {
+      res.status(404).json({ error: 'Support ticket not found.' });
+      return;
+    }
+
+    const status = String(req.body?.status || existing.status).trim();
+    if (!SUPPORT_STATUSES.has(status)) {
+      res.status(400).json({ error: 'Invalid ticket status.' });
+      return;
+    }
+
+    const adminReply =
+      req.body?.admin_reply !== undefined
+        ? sanitizePlainText(req.body.admin_reply, 2000)
+        : existing.admin_reply;
+
+    db.prepare(
+      `UPDATE support_tickets
+       SET status = ?, admin_reply = ?, handled_by = ?, updated_at = datetime('now')
+       WHERE id = ?`
+    ).run(status, adminReply, req.userId!, ticketDbId);
+
+    const statusLabel =
+      status === 'in_review'
+        ? 'In Review'
+        : status === 'resolved'
+        ? 'Resolved'
+        : status === 'closed'
+        ? 'Closed'
+        : 'Submitted';
+
+    createNotification(
+      existing.user_id,
+      req.userId!,
+      'support_reply',
+      ticketDbId,
+      adminReply
+        ? `updated SupportBox ticket ${existing.ticket_id} (${statusLabel}): ${adminReply.slice(0, 80)}`
+        : `marked SupportBox ticket ${existing.ticket_id} as ${statusLabel}`
+    );
+
+    const updated = db
+      .prepare(
+        `SELECT t.*,
+                u.name as user_name, u.username as user_username, u.avatar_url as user_avatar, u.email as user_email,
+                h.name as handled_by_name
+         FROM support_tickets t
+         JOIN users u ON u.id = t.user_id
+         LEFT JOIN users h ON h.id = t.handled_by
+         WHERE t.id = ?`
+      )
+      .get(ticketDbId);
+
+    res.json({ ticket: formatSupportTicketRow(updated) });
+  });
+
+  app.put('/api/admin/support/config', requireAuth, requireAdmin, (req, res) => {
+    const parsed = normalizeTelegramHandleInput(req.body?.telegram_handle);
+    if (!parsed.valid) {
+      res.status(400).json({ error: parsed.error || 'Invalid Telegram username.' });
+      return;
+    }
+
+    db.prepare(
+      `INSERT INTO app_settings (key, value, updated_at)
+       VALUES ('telegram_support_handle', ?, datetime('now'))
+       ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = datetime('now')`
+    ).run(parsed.handle);
+
+    res.json({ config: getSupportConfig() });
   });
 
   // Vite / Static Frontend integration

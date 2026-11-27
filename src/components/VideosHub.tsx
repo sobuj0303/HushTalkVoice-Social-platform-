@@ -11,14 +11,16 @@ import {
 } from 'lucide-react';
 import { Avatar, VerifiedBadge } from './Avatar';
 import { apiFetch } from '../lib/api';
+import { cachedApiFetch, invalidateApiCache } from '../lib/cache';
 import { MAX_WORDS, validateTextField } from '../shared/validation';
 import type { CommunityVideo, VideoComment } from '../shared/types';
 
 interface VideosHubProps {
+  currentUserId?: number;
   onOpenProfile: (userId: number) => void;
 }
 
-export const VideosHub: React.FC<VideosHubProps> = ({ onOpenProfile }) => {
+export const VideosHub: React.FC<VideosHubProps> = ({ currentUserId, onOpenProfile }) => {
   const [videos, setVideos] = useState<CommunityVideo[]>([]);
   const [search, setSearch] = useState('');
   const [selected, setSelected] = useState<CommunityVideo | null>(null);
@@ -46,10 +48,20 @@ export const VideosHub: React.FC<VideosHubProps> = ({ onOpenProfile }) => {
   const loadVideos = async (q: string) => {
     setLoading(true);
     try {
-      const data = await apiFetch<{ videos: CommunityVideo[] }>(
-        `/api/videos?q=${encodeURIComponent(q)}`
-      );
-      setVideos(data.videos);
+      const path = `/api/videos?q=${encodeURIComponent(q)}`;
+      const applyVideos = (data: { videos: CommunityVideo[] }) => {
+        setVideos(data.videos);
+        setSelected((prev) => prev ?? data.videos[0] ?? null);
+      };
+      const data =
+        !q && currentUserId
+          ? await cachedApiFetch<{ videos: CommunityVideo[] }>(path, {
+              userId: currentUserId,
+              ttlMs: 45_000,
+              onRevalidated: applyVideos,
+            })
+          : await apiFetch<{ videos: CommunityVideo[] }>(path);
+      applyVideos(data);
       if (!selected && data.videos.length > 0) {
         selectVideo(data.videos[0]);
       }
@@ -105,6 +117,7 @@ export const VideosHub: React.FC<VideosHubProps> = ({ onOpenProfile }) => {
           prev ? { ...prev, is_liked: res.liked, likes_count: res.likes_count } : prev
         );
       }
+      if (currentUserId) invalidateApiCache(currentUserId, '/api/videos');
     } catch {
       // ignore
     }
@@ -126,6 +139,7 @@ export const VideosHub: React.FC<VideosHubProps> = ({ onOpenProfile }) => {
           prev ? { ...prev, is_loved: res.loved, loves_count: res.loves_count } : prev
         );
       }
+      if (currentUserId) invalidateApiCache(currentUserId, '/api/videos');
     } catch {
       // ignore
     }
@@ -155,6 +169,7 @@ export const VideosHub: React.FC<VideosHubProps> = ({ onOpenProfile }) => {
         prev ? { ...prev, comments_count: prev.comments_count + 1 } : prev
       );
       setCommentText('');
+      if (currentUserId) invalidateApiCache(currentUserId, '/api/videos');
     } catch (err: any) {
       setCommentError(err?.message || 'Comment blocked.');
     }

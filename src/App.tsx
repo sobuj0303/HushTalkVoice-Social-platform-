@@ -13,6 +13,7 @@ import {
   Menu,
   X,
   Check,
+  Info,
 } from 'lucide-react';
 import { Logo } from './components/Logo';
 import { Avatar, VerifiedBadge } from './components/Avatar';
@@ -20,8 +21,10 @@ import { GlobalSearchBar } from './components/GlobalSearchBar';
 import { PWAInstallButton } from './components/PWAInstallButton';
 import { OfflineIndicator } from './components/OfflineIndicator';
 import { apiFetch, getStoredToken, setStoredToken } from './lib/api';
+import { invalidateApiCache } from './lib/cache';
+import { PerfProfiler } from './lib/perfMonitor';
 import { parsePositiveInt } from './shared/validation';
-import type { AuthUser, ThemeMode, UserSummary } from './shared/types';
+import type { AuthUser, SupportConfig, ThemeMode, UserSummary } from './shared/types';
 
 const AuthView = lazy(() => import('./components/AuthView').then((m) => ({ default: m.AuthView })));
 const HomeFeed = lazy(() => import('./components/HomeFeed').then((m) => ({ default: m.HomeFeed })));
@@ -36,6 +39,7 @@ const NotificationsView = lazy(() =>
   import('./components/NotificationsView').then((m) => ({ default: m.NotificationsView }))
 );
 const SettingsView = lazy(() => import('./components/SettingsView').then((m) => ({ default: m.SettingsView })));
+const AboutView = lazy(() => import('./components/AboutView').then((m) => ({ default: m.AboutView })));
 const AdminDashboard = lazy(() => import('./components/AdminDashboard').then((m) => ({ default: m.AdminDashboard })));
 const GroupInviteJoinModal = lazy(() =>
   import('./components/GroupInviteJoinModal').then((m) => ({ default: m.GroupInviteJoinModal }))
@@ -60,6 +64,7 @@ type NavSection =
   | 'profile'
   | 'notifications'
   | 'settings'
+  | 'about'
   | 'admin';
 
 interface PendingConnectionRequest {
@@ -114,6 +119,10 @@ export default function App() {
   // Real-time WebSocket state
   const wsRef = useRef<WebSocket | null>(null);
   const [wsEvent, setWsEvent] = useState<{ type: string; [key: string]: any } | null>(null);
+  const [supportConfig, setSupportConfig] = useState<SupportConfig | null>(null);
+  const [settingsSection, setSettingsSection] = useState<'menu' | 'preferences' | 'reports' | 'support'>('menu');
+  const [settingsSectionNonce, setSettingsSectionNonce] = useState(0);
+  const [homeRefreshSignal, setHomeRefreshSignal] = useState(0);
 
   const applyThemeImmediately = useCallback((mode: ThemeMode) => {
     const prefersDark =
@@ -241,6 +250,9 @@ export default function App() {
     }
 
     loadSidebarContext();
+    apiFetch<SupportConfig>('/api/support/config')
+      .then((cfg) => setSupportConfig(cfg))
+      .catch(() => {});
 
     let closedByCleanup = false;
     let reconnectTimer: number | null = null;
@@ -303,7 +315,9 @@ export default function App() {
   }, []);
 
   const handleLogout = async () => {
+    const uid = user?.id;
     await apiFetch('/api/auth/logout', { method: 'POST' }).catch(() => {});
+    invalidateApiCache(uid);
     setStoredToken(null);
     setUser(null);
     setSection('home');
@@ -427,6 +441,7 @@ export default function App() {
     { id: 'profile', label: 'Profile & Follows', icon: User },
     { id: 'notifications', label: 'Notifications', icon: Bell, badge: unreadNotifications },
     { id: 'settings', label: 'Settings', icon: Settings },
+    { id: 'about', label: 'About', icon: Info },
     ...(user.role === 'admin'
       ? [{ id: 'admin' as const, label: 'Admin Dashboard', icon: ShieldAlert }]
       : []),
@@ -434,7 +449,30 @@ export default function App() {
 
   const selectNav = (id: NavSection) => {
     if (id === 'profile') setProfileUserId(user.id);
+    if (id === 'home') {
+      setHighlightedPostId(null);
+      invalidateApiCache(user.id, '/api/posts');
+      setHomeRefreshSignal((prev) => prev + 1);
+      window.requestAnimationFrame(() => {
+        try {
+          window.scrollTo({ top: 0, behavior: 'smooth' });
+        } catch {
+          window.scrollTo(0, 0);
+        }
+      });
+    }
+    if (id === 'settings') {
+      setSettingsSection('menu');
+      setSettingsSectionNonce((prev) => prev + 1);
+    }
     setSection(id);
+    setDrawerOpen(false);
+  };
+
+  const openSettingsSupport = () => {
+    setSettingsSection('support');
+    setSettingsSectionNonce((prev) => prev + 1);
+    setSection('settings');
     setDrawerOpen(false);
   };
 
@@ -452,9 +490,14 @@ export default function App() {
             >
               <Menu className="w-5 h-5" />
             </button>
-            <div className="hidden sm:block">
+            <button
+              type="button"
+              onClick={() => selectNav('home')}
+              aria-label="Go to Home feed"
+              className="hidden sm:flex items-center cursor-pointer rounded-lg focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-purple-500/50"
+            >
               <Logo />
-            </div>
+            </button>
           </div>
 
           <div className="flex-1 flex justify-center min-w-0">
@@ -623,34 +666,41 @@ export default function App() {
         <main className="flex-1 min-w-0">
           <Suspense fallback={<ViewLoadingFallback />}>
             {section === 'home' && (
-              <HomeFeed
-                currentUser={user}
-                highlightedPostId={highlightedPostId}
-                wsEvent={wsEvent}
-                onClearHighlightedPost={() => {
-                  setHighlightedPostId(null);
-                  if (window.location.search.includes('post=')) {
-                    const nextUrl = new URL(window.location.href);
-                    nextUrl.searchParams.delete('post');
-                    window.history.replaceState({}, '', `${nextUrl.pathname}${nextUrl.search}`);
-                  }
-                }}
-                onOpenProfile={handleOpenProfile}
-                onOpenCircle={(circleId, circlePostId) => {
-                  setActiveCircleId(circleId);
-                  setHighlightedCirclePostId(circlePostId ?? null);
-                  setSection('circles');
-                  setDrawerOpen(false);
-                }}
-                onOpenConversation={(convId) => {
-                  setActiveConversationId(convId);
-                  setSection('messenger');
-                  setDrawerOpen(false);
-                }}
-              />
+              <PerfProfiler id="HomeFeed">
+                <HomeFeed
+                  currentUser={user}
+                  highlightedPostId={highlightedPostId}
+                  refreshSignal={homeRefreshSignal}
+                  wsEvent={wsEvent}
+                  onClearHighlightedPost={() => {
+                    setHighlightedPostId(null);
+                    if (window.location.search.includes('post=')) {
+                      const nextUrl = new URL(window.location.href);
+                      nextUrl.searchParams.delete('post');
+                      window.history.replaceState({}, '', `${nextUrl.pathname}${nextUrl.search}`);
+                    }
+                  }}
+                  onOpenProfile={handleOpenProfile}
+                  onOpenCircle={(circleId, circlePostId) => {
+                    setActiveCircleId(circleId);
+                    setHighlightedCirclePostId(circlePostId ?? null);
+                    setSection('circles');
+                    setDrawerOpen(false);
+                  }}
+                  onOpenConversation={(convId) => {
+                    setActiveConversationId(convId);
+                    setSection('messenger');
+                    setDrawerOpen(false);
+                  }}
+                />
+              </PerfProfiler>
             )}
             {section === 'people' && (
-              <FindPeople onStartChat={handleStartChat} onOpenProfile={handleOpenProfile} />
+              <FindPeople
+                currentUserId={user.id}
+                onStartChat={handleStartChat}
+                onOpenProfile={handleOpenProfile}
+              />
             )}
             {section === 'messenger' && (
               <MessengerView
@@ -662,27 +712,31 @@ export default function App() {
                 onOpenProfile={handleOpenProfile}
               />
             )}
-            {section === 'videos' && <VideosHub onOpenProfile={handleOpenProfile} />}
+            {section === 'videos' && (
+              <VideosHub currentUserId={user.id} onOpenProfile={handleOpenProfile} />
+            )}
             {section === 'circles' && (
-              <CirclesView
-                currentUser={user}
-                initialCircleId={activeCircleId}
-                highlightedPostId={highlightedCirclePostId}
-                onClearHighlightedPost={() => {
-                  setHighlightedCirclePostId(null);
-                  if (window.location.search.includes('circlePost=')) {
-                    const nextUrl = new URL(window.location.href);
-                    nextUrl.searchParams.delete('circlePost');
-                    window.history.replaceState({}, '', `${nextUrl.pathname}${nextUrl.search}`);
-                  }
-                }}
-                onOpenProfile={handleOpenProfile}
-                onOpenConversation={(convId) => {
-                  setActiveConversationId(convId);
-                  setSection('messenger');
-                  setDrawerOpen(false);
-                }}
-              />
+              <PerfProfiler id="CirclesView">
+                <CirclesView
+                  currentUser={user}
+                  initialCircleId={activeCircleId}
+                  highlightedPostId={highlightedCirclePostId}
+                  onClearHighlightedPost={() => {
+                    setHighlightedCirclePostId(null);
+                    if (window.location.search.includes('circlePost=')) {
+                      const nextUrl = new URL(window.location.href);
+                      nextUrl.searchParams.delete('circlePost');
+                      window.history.replaceState({}, '', `${nextUrl.pathname}${nextUrl.search}`);
+                    }
+                  }}
+                  onOpenProfile={handleOpenProfile}
+                  onOpenConversation={(convId) => {
+                    setActiveConversationId(convId);
+                    setSection('messenger');
+                    setDrawerOpen(false);
+                  }}
+                />
+              </PerfProfiler>
             )}
             {section === 'profile' && (
               <ProfileAndFollows
@@ -700,8 +754,21 @@ export default function App() {
               <SettingsView
                 currentUser={user}
                 activeTheme={themeMode}
+                initialSection={settingsSection}
+                sectionNonce={settingsSectionNonce}
+                supportHandle={supportConfig?.telegram_handle || ''}
                 onThemeChange={handleThemeChange}
                 onUserUpdated={(updated) => setUser(updated)}
+                onSupportConfigUpdated={setSupportConfig}
+              />
+            )}
+            {section === 'about' && (
+              <AboutView
+                appVersion={supportConfig?.app_version || '2.4.0'}
+                telegramHandle={supportConfig?.telegram_handle || ''}
+                telegramUrl={supportConfig?.telegram_url || ''}
+                onOpenSupport={openSettingsSupport}
+                onOpenSettings={() => selectNav('settings')}
               />
             )}
             {section === 'admin' && user.role === 'admin' && (

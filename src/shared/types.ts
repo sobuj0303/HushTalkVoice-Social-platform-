@@ -309,6 +309,11 @@ export interface CirclePostComment {
 export interface CirclePostItem {
   id: number;
   circle_id: number;
+  circle_name?: string;
+  circle_category?: string;
+  circle_privacy?: CirclePrivacy;
+  circle_avatar?: string;
+  circle_viewer_role?: CircleRole | null;
   user_id: number;
   author_name: string;
   author_username: string;
@@ -348,6 +353,7 @@ export interface CircleKeywordRule {
   keyword: string;
   reply_text: string;
   create_inquiry: boolean;
+  is_active: boolean;
   hit_count: number;
   created_at: string;
 }
@@ -426,6 +432,99 @@ export interface GlobalSearchResults {
     member_count: number;
   }[];
 }
+export type SupportCategory =
+  | 'bug_error'
+  | 'crash_performance'
+  | 'account_access'
+  | 'feature_request'
+  | 'safety_policy'
+  | 'other';
 
+export type SupportTicketStatus = 'submitted' | 'in_review' | 'resolved' | 'closed';
 
+export interface SupportConfig {
+  telegram_handle: string;
+  telegram_url: string;
+  telegram_bot_configured: boolean;
+  app_version: string;
+}
 
+export interface SupportTicketItem {
+  id: number;
+  ticket_id: string;
+  user_id: number;
+  user_name?: string;
+  user_username?: string;
+  user_avatar?: string;
+  user_email?: string;
+  category: SupportCategory;
+  affected_area: string;
+  subject: string;
+  description: string;
+  screenshot_url: string;
+  device_info: string;
+  telegram_forwarded: boolean;
+  status: SupportTicketStatus;
+  admin_reply: string;
+  handled_by_name?: string;
+  created_at: string;
+  updated_at: string;
+}
+
+export type ReportTargetType = 'post' | 'video' | 'user' | 'group' | 'circle_post';
+export type ReportStatus = 'pending' | 'resolved' | 'dismissed';
+
+export interface ReportActivityItem {
+  id: number;
+  case_id: string;
+  target_type: ReportTargetType;
+  target_id: number;
+  target_name: string;
+  target_username: string;
+  target_avatar: string;
+  target_summary: string;
+  reason: string;
+  status: ReportStatus;
+  created_at: string;
+}
+
+export interface CommunityReportSummaryItem {
+  user_id: number;
+  name: string;
+  username: string;
+  avatar_url: string;
+  is_verified: boolean;
+  received_count: number;
+  given_count: number;
+  pending_received: number;
+}
+
+export interface CommunityReportCaseItem {
+  id: number;
+  case_id: string;
+  reporter_id: number;
+  reporter_name: string;
+  reporter_username: string;
+  target_type: ReportTargetType;
+  target_id: number;
+  target_name: string;
+  target_username: string;
+  target_summary: string;
+  reason: string;
+  status: ReportStatus;
+  created_at: string;
+}
+
+export interface ReportActivityPayload {
+  summary: {
+    received_count: number;
+    given_count: number;
+    pending_received: number;
+    resolved_received: number;
+    pending_given: number;
+  };
+  reports_received: ReportActivityItem[];
+  reports_given: ReportActivityItem[];
+  community_summary?: CommunityReportSummaryItem[];
+  community_cases?: CommunityReportCaseItem[];
+}

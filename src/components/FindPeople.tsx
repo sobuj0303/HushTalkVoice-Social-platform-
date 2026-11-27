@@ -2,14 +2,20 @@ import React, { useEffect, useState } from 'react';
 import { Search, UserPlus, UserCheck, MessageSquare, Check, Clock, Users } from 'lucide-react';
 import { Avatar, VerifiedBadge } from './Avatar';
 import { apiFetch } from '../lib/api';
+import { cachedApiFetch, invalidateApiCache } from '../lib/cache';
 import type { PersonDirectoryItem } from '../shared/types';
 
 interface FindPeopleProps {
+  currentUserId?: number;
   onStartChat: (userId: number) => void;
   onOpenProfile: (userId: number) => void;
 }
 
-export const FindPeople: React.FC<FindPeopleProps> = ({ onStartChat, onOpenProfile }) => {
+export const FindPeople: React.FC<FindPeopleProps> = ({
+  currentUserId,
+  onStartChat,
+  onOpenProfile,
+}) => {
   const [query, setQuery] = useState('');
   const [filter, setFilter] = useState<'all' | 'online' | 'popular'>('all');
   const [people, setPeople] = useState<PersonDirectoryItem[]>([]);
@@ -18,9 +24,15 @@ export const FindPeople: React.FC<FindPeopleProps> = ({ onStartChat, onOpenProfi
   const loadPeople = async (searchQuery: string, activeFilter: string) => {
     setLoading(true);
     try {
-      const data = await apiFetch<{ people: PersonDirectoryItem[] }>(
-        `/api/people?q=${encodeURIComponent(searchQuery)}&filter=${activeFilter}`
-      );
+      const path = `/api/people?q=${encodeURIComponent(searchQuery)}&filter=${activeFilter}`;
+      const data =
+        !searchQuery.trim() && currentUserId
+          ? await cachedApiFetch<{ people: PersonDirectoryItem[] }>(path, {
+              userId: currentUserId,
+              ttlMs: 30_000,
+              onRevalidated: (fresh) => setPeople(fresh.people),
+            })
+          : await apiFetch<{ people: PersonDirectoryItem[] }>(path);
       setPeople(data.people);
     } catch {
       // ignore
@@ -41,6 +53,10 @@ export const FindPeople: React.FC<FindPeopleProps> = ({ onStartChat, onOpenProfi
       const res = await apiFetch<{ following: boolean }>(`/api/users/${personId}/follow`, {
         method: 'POST',
       });
+      if (currentUserId) {
+        invalidateApiCache(currentUserId, '/api/people');
+        invalidateApiCache(currentUserId, '/api/posts');
+      }
       setPeople((prev) =>
         prev.map((p) =>
           p.id === personId
@@ -64,6 +80,10 @@ export const FindPeople: React.FC<FindPeopleProps> = ({ onStartChat, onOpenProfi
           method: 'POST',
           body: JSON.stringify({ action: 'accept' }),
         });
+        if (currentUserId) {
+          invalidateApiCache(currentUserId, '/api/people');
+          invalidateApiCache(currentUserId, '/api/posts');
+        }
         setPeople((prev) =>
           prev.map((p) => (p.id === person.id ? { ...p, connection_status: 'accepted' } : p))
         );
@@ -72,6 +92,9 @@ export const FindPeople: React.FC<FindPeopleProps> = ({ onStartChat, onOpenProfi
           method: 'POST',
           body: JSON.stringify({ userId: person.id }),
         });
+        if (currentUserId) {
+          invalidateApiCache(currentUserId, '/api/people');
+        }
         setPeople((prev) =>
           prev.map((p) =>
             p.id === person.id

@@ -10,8 +10,11 @@ import {
   X,
 } from 'lucide-react';
 import { Avatar } from './Avatar';
+import { FeedSkeleton } from './FeedSkeleton';
 import { PostCard } from './PostCard';
 import { apiFetch, uploadMediaFile } from '../lib/api';
+import { cachedApiFetch, invalidateApiCache } from '../lib/cache';
+import { useRenderPerf } from '../lib/perfMonitor';
 import {
   countWords,
   MAX_WORDS,
@@ -23,6 +26,7 @@ import type { AuthUser, PostItem } from '../shared/types';
 interface HomeFeedProps {
   currentUser: AuthUser;
   highlightedPostId?: number | null;
+  refreshSignal?: number;
   wsEvent?: { type: string; [key: string]: any } | null;
   onClearHighlightedPost?: () => void;
   onOpenProfile: (userId: number) => void;
@@ -35,19 +39,23 @@ type FeedFilter = 'all' | 'global' | 'connections' | 'following' | 'popular' | '
 export const HomeFeed: React.FC<HomeFeedProps> = ({
   currentUser,
   highlightedPostId = null,
+  refreshSignal = 0,
   wsEvent = null,
   onClearHighlightedPost,
   onOpenProfile,
   onOpenCircle,
   onOpenConversation,
 }) => {
+  useRenderPerf('HomeFeed');
   const [posts, setPosts] = useState<PostItem[]>([]);
   const [filter, setFilter] = useState<FeedFilter>('all');
   const [verifiedOnly, setVerifiedOnly] = useState(false);
   const [loading, setLoading] = useState(true);
+  const [refreshing, setRefreshing] = useState(false);
   const [loadingMore, setLoadingMore] = useState(false);
   const [hasMore, setHasMore] = useState(false);
   const [sharedMissing, setSharedMissing] = useState(false);
+  const feedTopRef = useRef<HTMLDivElement>(null);
 
   // Composer state
   const [content, setContent] = useState('');
@@ -92,38 +100,68 @@ export const HomeFeed: React.FC<HomeFeedProps> = ({
   }, []);
 
   const FEED_PAGE_SIZE = 15;
+  const feedRequestSeqRef = useRef(0);
 
   const loadPosts = useCallback(
-    async (activeFilter: FeedFilter, onlyVerified: boolean) => {
-      setLoading(true);
+    async (
+      activeFilter: FeedFilter,
+      onlyVerified: boolean,
+      forceRefresh = false,
+      keepVisibleDuringRefresh = false
+    ) => {
+      const seq = ++feedRequestSeqRef.current;
+      if (keepVisibleDuringRefresh) {
+        setRefreshing(true);
+      } else {
+        setLoading(true);
+      }
       setSharedMissing(false);
       try {
         const verifiedParam = activeFilter === 'global' && onlyVerified ? '&verifiedOnly=1' : '';
-        const data = await apiFetch<{ posts: PostItem[]; hasMore?: boolean }>(
-          `/api/posts?filter=${activeFilter}&limit=${FEED_PAGE_SIZE}&offset=0${verifiedParam}`
-        );
-        let merged = data.posts;
+        const path = `/api/posts?filter=${activeFilter}&limit=${FEED_PAGE_SIZE}&offset=0${verifiedParam}`;
 
-        if (highlightedPostId && !merged.some((p) => p.id === highlightedPostId)) {
-          try {
-            const single = await apiFetch<{ post: PostItem }>(`/api/posts/${highlightedPostId}`);
-            if (single.post) {
-              merged = [single.post, ...merged];
+        const applyFeedPayload = async (data: { posts: PostItem[]; hasMore?: boolean }) => {
+          if (feedRequestSeqRef.current !== seq) return;
+          let merged = data.posts;
+
+          if (highlightedPostId && !merged.some((p) => p.id === highlightedPostId)) {
+            try {
+              const single = await apiFetch<{ post: PostItem }>(`/api/posts/${highlightedPostId}`);
+              if (single.post && feedRequestSeqRef.current === seq) {
+                merged = [single.post, ...merged];
+              }
+            } catch {
+              if (feedRequestSeqRef.current === seq) setSharedMissing(true);
             }
-          } catch {
-            setSharedMissing(true);
           }
-        }
 
-        setPosts(merged);
-        setHasMore(Boolean(data.hasMore));
+          if (feedRequestSeqRef.current === seq) {
+            setPosts(merged);
+            setHasMore(Boolean(data.hasMore));
+          }
+        };
+
+        const data = await cachedApiFetch<{ posts: PostItem[]; hasMore?: boolean }>(path, {
+          userId: currentUser.id,
+          ttlMs: 45_000,
+          forceRefresh,
+          onRevalidated: (fresh) => {
+            void applyFeedPayload(fresh);
+          },
+        });
+        await applyFeedPayload(data);
       } catch (err: any) {
-        showToast(err?.message || 'Could not load feed posts.', 'error');
+        if (feedRequestSeqRef.current === seq) {
+          showToast(err?.message || 'Could not load feed posts.', 'error');
+        }
       } finally {
-        setLoading(false);
+        if (feedRequestSeqRef.current === seq) {
+          setLoading(false);
+          setRefreshing(false);
+        }
       }
     },
-    [highlightedPostId, showToast]
+    [currentUser.id, highlightedPostId, showToast]
   );
 
   const handleLoadMore = async () => {
@@ -147,9 +185,48 @@ export const HomeFeed: React.FC<HomeFeedProps> = ({
     }
   };
 
+  const lastRefreshSignalRef = useRef(refreshSignal);
+  const postsCountRef = useRef(posts.length);
+  const skipNextFilterLoadRef = useRef(false);
+
   useEffect(() => {
-    loadPosts(filter, verifiedOnly);
+    postsCountRef.current = posts.length;
+  }, [posts.length]);
+
+  const scrollToFeedTop = useCallback(() => {
+    window.requestAnimationFrame(() => {
+      try {
+        window.scrollTo({ top: 0, behavior: 'smooth' });
+      } catch {
+        window.scrollTo(0, 0);
+      }
+      feedTopRef.current?.scrollIntoView({ behavior: 'smooth', block: 'start' });
+    });
+  }, []);
+
+  useEffect(() => {
+    if (skipNextFilterLoadRef.current) {
+      skipNextFilterLoadRef.current = false;
+      return;
+    }
+    void loadPosts(filter, verifiedOnly);
   }, [filter, verifiedOnly, loadPosts]);
+
+  useEffect(() => {
+    if (refreshSignal === lastRefreshSignalRef.current) return;
+    lastRefreshSignalRef.current = refreshSignal;
+    setLiveBanner(null);
+    if (filter !== 'all' || verifiedOnly) {
+      skipNextFilterLoadRef.current = true;
+      setFilter('all');
+      setVerifiedOnly(false);
+    }
+    invalidateApiCache(currentUser.id, '/api/posts');
+    scrollToFeedTop();
+    void loadPosts('all', false, true, postsCountRef.current > 0).then(() => {
+      showToast('Posts refreshed.', 'success');
+    });
+  }, [refreshSignal, currentUser.id, filter, verifiedOnly, loadPosts, scrollToFeedTop, showToast]);
 
   useEffect(() => {
     if (!wsEvent) return;
@@ -217,6 +294,7 @@ export const HomeFeed: React.FC<HomeFeedProps> = ({
         }),
       });
       setPosts((prev) => [data.post, ...prev]);
+      invalidateApiCache(currentUser.id, '/api/posts');
       setContent('');
       setMediaType('none');
       setMediaUrl('');
@@ -228,19 +306,31 @@ export const HomeFeed: React.FC<HomeFeedProps> = ({
     }
   };
 
-  const handlePostUpdated = useCallback((updated: PostItem) => {
-    setPosts((prev) => prev.map((p) => (p.id === updated.id ? updated : p)));
-  }, []);
+  const handlePostUpdated = useCallback(
+    (updated: PostItem) => {
+      setPosts((prev) => prev.map((p) => (p.id === updated.id ? updated : p)));
+      invalidateApiCache(currentUser.id, '/api/posts');
+    },
+    [currentUser.id]
+  );
 
   const handlePostViewSynced = useCallback((postId: number, viewsCount: number) => {
     setPosts((prev) =>
-      prev.map((p) => (p.id === postId ? { ...p, views_count: viewsCount, has_viewed: true } : p))
+      prev.map((p) =>
+        p.id === postId
+          ? { ...p, views_count: Math.max(p.views_count, viewsCount), has_viewed: true }
+          : p
+      )
     );
   }, []);
 
-  const handlePostDeleted = useCallback((postId: number) => {
-    setPosts((prev) => prev.filter((p) => p.id !== postId));
-  }, []);
+  const handlePostDeleted = useCallback(
+    (postId: number) => {
+      setPosts((prev) => prev.filter((p) => p.id !== postId));
+      invalidateApiCache(currentUser.id, '/api/posts');
+    },
+    [currentUser.id]
+  );
 
   const handleFollowCircle = useCallback(
     async (circleId: number) => {
@@ -249,6 +339,8 @@ export const HomeFeed: React.FC<HomeFeedProps> = ({
           `/api/circles/${circleId}/follow`,
           { method: 'POST' }
         );
+        invalidateApiCache(currentUser.id, '/api/posts');
+        invalidateApiCache(currentUser.id, '/api/circles');
         if (res.following) {
           setPosts((prev) =>
             prev.map((p) =>
@@ -274,7 +366,7 @@ export const HomeFeed: React.FC<HomeFeedProps> = ({
         showToast(err?.message || 'Could not update Circle follow status.', 'error');
       }
     },
-    [showToast]
+    [currentUser.id, showToast]
   );
 
   const handleSubmitInquiry = async (e: React.FormEvent) => {
@@ -320,11 +412,11 @@ export const HomeFeed: React.FC<HomeFeedProps> = ({
   };
 
   return (
-    <div className="space-y-5">
+    <div ref={feedTopRef} className="space-y-5 min-w-0 w-full scroll-mt-20">
       {toast && (
         <div
           role="status"
-          className={`fixed bottom-20 lg:bottom-6 right-4 sm:right-6 z-40 rounded-xl border px-4 py-2.5 text-xs font-medium shadow-xl backdrop-blur-md ${
+          className={`fixed bottom-20 lg:bottom-6 right-4 sm:right-6 z-40 max-w-[calc(100vw-2rem)] rounded-xl border px-4 py-2.5 text-xs font-medium shadow-xl backdrop-blur-md ${
             toast.variant === 'error'
               ? 'border-rose-500/40 bg-rose-500/15 text-rose-700 dark:text-rose-200'
               : 'border-emerald-500/40 bg-emerald-500/15 text-emerald-700 dark:text-emerald-200'
@@ -335,28 +427,29 @@ export const HomeFeed: React.FC<HomeFeedProps> = ({
       )}
 
       {liveBanner && (
-        <div className="rounded-xl border border-orange-500/35 bg-gradient-to-r from-purple-500/15 to-orange-500/15 px-4 py-2.5 flex items-center justify-between gap-2 text-xs">
-          <span className="inline-flex items-center gap-2 font-semibold text-orange-600 dark:text-orange-300">
+        <div className="rounded-xl border border-orange-500/35 bg-gradient-to-r from-purple-500/15 to-orange-500/15 px-4 py-2.5 flex items-center justify-between gap-2 flex-wrap min-w-0 text-xs">
+          <span className="inline-flex items-center gap-2 font-semibold text-orange-600 dark:text-orange-300 min-w-0">
             <CircleDot className="w-4 h-4 shrink-0" />
-            {liveBanner}
+            <span className="break-words">{liveBanner}</span>
           </span>
-          <div className="flex items-center gap-1.5">
+          <div className="flex items-center gap-1.5 shrink-0 ml-auto">
             <button
               type="button"
               onClick={() => {
                 setLiveBanner(null);
-                loadPosts(filter, verifiedOnly);
+                invalidateApiCache(currentUser.id, '/api/posts');
+                loadPosts(filter, verifiedOnly, true);
               }}
-              className="px-2.5 py-1 rounded-lg htv-gradient-btn text-[11px] font-semibold inline-flex items-center gap-1 cursor-pointer"
+              className="px-2.5 py-1 rounded-lg htv-gradient-btn text-[11px] font-semibold inline-flex items-center gap-1 whitespace-nowrap shrink-0 cursor-pointer"
             >
-              <RefreshCw className="w-3 h-3" />
+              <RefreshCw className="w-3 h-3 shrink-0" />
               Refresh
             </button>
             <button
               type="button"
               onClick={() => setLiveBanner(null)}
               aria-label="Dismiss new post notification"
-              className="p-1 rounded-lg text-[var(--htv-text-dim)] hover:text-[var(--htv-text)] cursor-pointer"
+              className="p-1 rounded-lg text-[var(--htv-text-dim)] hover:text-[var(--htv-text)] shrink-0 cursor-pointer"
             >
               <X className="w-3.5 h-3.5" />
             </button>
@@ -365,8 +458,8 @@ export const HomeFeed: React.FC<HomeFeedProps> = ({
       )}
 
       {highlightedPostId && (
-        <div className="rounded-xl border border-purple-500/35 bg-purple-500/10 px-4 py-2.5 flex items-center justify-between gap-2 text-xs">
-          <span className="text-purple-700 dark:text-purple-200 font-medium">
+        <div className="rounded-xl border border-purple-500/35 bg-purple-500/10 px-4 py-2.5 flex items-center justify-between gap-2 flex-wrap min-w-0 text-xs">
+          <span className="text-purple-700 dark:text-purple-200 font-medium min-w-0 break-words">
             {sharedMissing
               ? 'The shared post link could not be found or was deleted.'
               : `Viewing shared post #${highlightedPostId}`}
@@ -375,7 +468,7 @@ export const HomeFeed: React.FC<HomeFeedProps> = ({
             <button
               type="button"
               onClick={onClearHighlightedPost}
-              className="px-2.5 py-1 rounded-lg htv-elevated hover:bg-[var(--htv-hover)] text-[11px] font-semibold cursor-pointer"
+              className="px-2.5 py-1 rounded-lg htv-elevated hover:bg-[var(--htv-hover)] text-[11px] font-semibold shrink-0 whitespace-nowrap ml-auto cursor-pointer"
             >
               Clear
             </button>
@@ -399,7 +492,7 @@ export const HomeFeed: React.FC<HomeFeedProps> = ({
               className="w-full rounded-xl htv-elevated p-3 text-sm text-[var(--htv-text)] placeholder:text-[var(--htv-text-dim)] resize-none focus:outline-none focus:ring-2 focus:ring-purple-500/50"
             />
 
-            <div className="flex items-center justify-between text-xs">
+            <div className="flex items-center justify-between gap-2 flex-wrap text-xs">
               <span
                 className={`font-mono-tabular ${
                   wordCount > MAX_WORDS
@@ -477,34 +570,54 @@ export const HomeFeed: React.FC<HomeFeedProps> = ({
 
       {/* Filter Bar */}
       <div className="space-y-2">
-        <div className="flex items-center gap-1.5 p-1.5 htv-card rounded-xl overflow-x-auto">
-          {(
-            [
-              { id: 'all', label: 'All Posts' },
-              { id: 'global', label: 'Global', icon: Globe },
-              { id: 'connections', label: 'Connections' },
-              { id: 'following', label: 'Following' },
-              { id: 'popular', label: 'Popular' },
-              { id: 'recent', label: 'Recent' },
-            ] as const
-          ).map((tab) => {
-            const Icon = 'icon' in tab ? tab.icon : null;
-            return (
-              <button
-                key={tab.id}
-                type="button"
-                onClick={() => setFilter(tab.id)}
-                className={`px-3.5 py-2 rounded-lg text-xs font-semibold whitespace-nowrap shrink-0 inline-flex items-center gap-1.5 transition-colors cursor-pointer ${
-                  filter === tab.id
-                    ? 'htv-gradient-btn'
-                    : 'text-[var(--htv-text-muted)] hover:text-[var(--htv-text)] hover:bg-[var(--htv-hover)]'
-                }`}
-              >
-                {Icon && <Icon className="w-3.5 h-3.5" />}
-                {tab.label}
-              </button>
-            );
-          })}
+        <div className="flex items-center justify-between gap-2 p-1.5 htv-card rounded-xl">
+          <div className="flex items-center gap-1.5 overflow-x-auto min-w-0 flex-1">
+            {(
+              [
+                { id: 'all', label: 'All Posts' },
+                { id: 'global', label: 'Global', icon: Globe },
+                { id: 'connections', label: 'Connections' },
+                { id: 'following', label: 'Following' },
+                { id: 'popular', label: 'Popular' },
+                { id: 'recent', label: 'Recent' },
+              ] as const
+            ).map((tab) => {
+              const Icon = 'icon' in tab ? tab.icon : null;
+              return (
+                <button
+                  key={tab.id}
+                  type="button"
+                  onClick={() => setFilter(tab.id)}
+                  className={`px-3.5 py-2 rounded-lg text-xs font-semibold whitespace-nowrap shrink-0 inline-flex items-center gap-1.5 transition-colors cursor-pointer ${
+                    filter === tab.id
+                      ? 'htv-gradient-btn'
+                      : 'text-[var(--htv-text-muted)] hover:text-[var(--htv-text)] hover:bg-[var(--htv-hover)]'
+                  }`}
+                >
+                  {Icon && <Icon className="w-3.5 h-3.5" />}
+                  {tab.label}
+                </button>
+              );
+            })}
+          </div>
+
+          <button
+            type="button"
+            onClick={() => {
+              invalidateApiCache(currentUser.id, '/api/posts');
+              scrollToFeedTop();
+              void loadPosts(filter, verifiedOnly, true, posts.length > 0).then(() => {
+                showToast('Posts refreshed.', 'success');
+              });
+            }}
+            disabled={refreshing || loading}
+            aria-label="Refresh posts"
+            title="Refresh posts"
+            className="px-3 py-2 rounded-lg htv-elevated hover:bg-[var(--htv-hover)] text-xs font-semibold inline-flex items-center gap-1.5 whitespace-nowrap shrink-0 cursor-pointer disabled:opacity-50"
+          >
+            <RefreshCw className={`w-3.5 h-3.5 shrink-0 ${refreshing ? 'animate-spin text-orange-500' : ''}`} />
+            <span className="hidden sm:inline">{refreshing ? 'Refreshing' : 'Refresh'}</span>
+          </button>
         </div>
 
         {filter === 'global' && (
@@ -519,7 +632,7 @@ export const HomeFeed: React.FC<HomeFeedProps> = ({
               type="button"
               onClick={() => setVerifiedOnly((prev) => !prev)}
               aria-pressed={verifiedOnly}
-              className={`px-3 py-1.5 rounded-lg text-[11px] font-semibold inline-flex items-center gap-1.5 cursor-pointer transition-colors shrink-0 ${
+              className={`px-3 py-1.5 rounded-lg text-[11px] font-semibold inline-flex items-center gap-1.5 cursor-pointer transition-colors shrink-0 whitespace-nowrap ${
                 verifiedOnly
                   ? 'bg-gradient-to-r from-emerald-500 to-teal-500 text-white shadow-sm'
                   : 'htv-elevated text-[var(--htv-text-muted)] hover:text-[var(--htv-text)]'
@@ -534,35 +647,7 @@ export const HomeFeed: React.FC<HomeFeedProps> = ({
 
       {/* Posts List */}
       {loading ? (
-        <div className="space-y-4" aria-label="Loading posts">
-          {[1, 2, 3].map((n) => (
-            <div key={n} className="htv-card rounded-2xl p-4 sm:p-5 animate-pulse space-y-3.5">
-              <div className="flex items-center justify-between gap-3">
-                <div className="flex items-center gap-3">
-                  <div className="w-10 h-10 rounded-full htv-elevated shrink-0" />
-                  <div className="space-y-1.5">
-                    <div className="h-3.5 w-32 htv-elevated rounded" />
-                    <div className="h-2.5 w-24 htv-elevated rounded" />
-                  </div>
-                </div>
-                <div className="w-6 h-6 rounded-lg htv-elevated" />
-              </div>
-              <div className="space-y-2">
-                <div className="h-3.5 w-full htv-elevated rounded" />
-                <div className="h-3.5 w-4/5 htv-elevated rounded" />
-              </div>
-              {n === 1 && <div className="h-44 w-full htv-elevated rounded-xl" />}
-              <div className="flex items-center justify-between pt-2 border-t border-[var(--htv-border-subtle)]">
-                <div className="flex items-center gap-2">
-                  <div className="h-7 w-14 htv-elevated rounded-lg" />
-                  <div className="h-7 w-14 htv-elevated rounded-lg" />
-                  <div className="h-7 w-16 htv-elevated rounded-lg" />
-                </div>
-                <div className="h-7 w-16 htv-elevated rounded-lg" />
-              </div>
-            </div>
-          ))}
-        </div>
+        <FeedSkeleton variant="home" count={3} label="Loading posts" />
       ) : posts.length === 0 ? (
         <div className="htv-card rounded-2xl p-8 text-center space-y-2">
           <p className="font-display font-semibold text-base">No posts in this feed yet</p>

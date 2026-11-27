@@ -236,11 +236,11 @@ export const ProfileAndFollows: React.FC<ProfileAndFollowsProps> = ({
   const safeCoverSrc = sanitizeMediaUrl(editing ? coverUrl : profile.cover_url);
 
   return (
-    <div className="space-y-5">
+    <div className="space-y-5 min-w-0 w-full">
       {toast && (
         <div
           role="status"
-          className={`fixed bottom-20 lg:bottom-6 right-4 sm:right-6 z-40 rounded-xl border px-4 py-2.5 text-xs font-medium shadow-xl backdrop-blur-md ${
+          className={`fixed bottom-20 lg:bottom-6 right-4 sm:right-6 z-40 max-w-[calc(100vw-2rem)] rounded-xl border px-4 py-2.5 text-xs font-medium shadow-xl backdrop-blur-md ${
             toast.variant === 'error'
               ? 'border-rose-500/40 bg-rose-500/15 text-rose-700 dark:text-rose-200'
               : 'border-emerald-500/40 bg-emerald-500/15 text-emerald-700 dark:text-emerald-200'
@@ -398,8 +398,8 @@ export const ProfileAndFollows: React.FC<ProfileAndFollowsProps> = ({
               {profile.facebook_link && (
                 <>
                   <span aria-hidden="true">·</span>
-                  <span className="inline-flex items-center gap-1 text-purple-700 dark:text-purple-300">
-                    <ExternalLink className="w-3.5 h-3.5" />
+                  <span className="inline-flex items-center gap-1 text-purple-700 dark:text-purple-300 min-w-0 max-w-full break-all">
+                    <ExternalLink className="w-3.5 h-3.5 shrink-0" />
                     Facebook: {profile.facebook_link}
                   </span>
                 </>
@@ -411,7 +411,7 @@ export const ProfileAndFollows: React.FC<ProfileAndFollowsProps> = ({
           {!isOwn && showReportBox && (
             <form
               onSubmit={handleReportProfile}
-              className="mt-4 p-3.5 rounded-xl htv-elevated flex items-center gap-2 flex-wrap"
+              className="mt-4 p-3.5 rounded-xl htv-elevated flex flex-col sm:flex-row sm:items-center gap-2 min-w-0"
             >
               <input
                 type="text"
@@ -419,11 +419,11 @@ export const ProfileAndFollows: React.FC<ProfileAndFollowsProps> = ({
                 value={reportReason}
                 onChange={(e) => setReportReason(e.target.value)}
                 placeholder="Reason for reporting this profile..."
-                className="flex-1 min-w-[200px] h-9 px-3 rounded-lg bg-[var(--htv-input)] border border-[var(--htv-border-subtle)] text-xs text-[var(--htv-text)]"
+                className="w-full sm:flex-1 min-w-0 h-9 px-3 rounded-lg bg-[var(--htv-input)] border border-[var(--htv-border-subtle)] text-xs text-[var(--htv-text)]"
               />
               <button
                 type="submit"
-                className="px-3.5 py-2 rounded-lg bg-amber-600 hover:bg-amber-500 text-white text-xs font-semibold cursor-pointer"
+                className="w-full sm:w-auto px-3.5 py-2 rounded-lg bg-amber-600 hover:bg-amber-500 text-white text-xs font-semibold shrink-0 whitespace-nowrap cursor-pointer"
               >
                 Submit Report
               </button>
@@ -526,11 +526,11 @@ export const ProfileAndFollows: React.FC<ProfileAndFollowsProps> = ({
       </div>
 
       {/* 3 Profile Tabs: Posts, Followers (count), Following (count) */}
-      <div className="flex items-center gap-1.5 p-1.5 htv-card rounded-xl">
+      <div className="flex items-center gap-1.5 p-1.5 htv-card rounded-xl overflow-x-auto">
         <button
           type="button"
           onClick={() => setActiveTab('posts')}
-          className={`flex-1 py-2 px-3 rounded-lg text-xs font-semibold cursor-pointer ${
+          className={`flex-1 py-2 px-3 rounded-lg text-xs font-semibold whitespace-nowrap shrink-0 cursor-pointer ${
             activeTab === 'posts'
               ? 'htv-gradient-btn'
               : 'text-[var(--htv-text-muted)] hover:text-[var(--htv-text)]'
@@ -541,7 +541,7 @@ export const ProfileAndFollows: React.FC<ProfileAndFollowsProps> = ({
         <button
           type="button"
           onClick={() => setActiveTab('followers')}
-          className={`flex-1 py-2 px-3 rounded-lg text-xs font-semibold cursor-pointer ${
+          className={`flex-1 py-2 px-3 rounded-lg text-xs font-semibold whitespace-nowrap shrink-0 cursor-pointer ${
             activeTab === 'followers'
               ? 'htv-gradient-btn'
               : 'text-[var(--htv-text-muted)] hover:text-[var(--htv-text)]'
@@ -552,7 +552,7 @@ export const ProfileAndFollows: React.FC<ProfileAndFollowsProps> = ({
         <button
           type="button"
           onClick={() => setActiveTab('following')}
-          className={`flex-1 py-2 px-3 rounded-lg text-xs font-semibold cursor-pointer ${
+          className={`flex-1 py-2 px-3 rounded-lg text-xs font-semibold whitespace-nowrap shrink-0 cursor-pointer ${
             activeTab === 'following'
               ? 'htv-gradient-btn'
               : 'text-[var(--htv-text-muted)] hover:text-[var(--htv-text)]'
@@ -591,7 +591,7 @@ export const ProfileAndFollows: React.FC<ProfileAndFollowsProps> = ({
                   setPosts((prev) =>
                     prev.map((item) =>
                       item.id === postId
-                        ? { ...item, views_count: viewsCount, has_viewed: true }
+                        ? { ...item, views_count: Math.max(item.views_count, viewsCount), has_viewed: true }
                         : item
                     )
                   )

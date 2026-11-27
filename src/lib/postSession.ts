@@ -1,14 +1,20 @@
 const inFlightUserViews = new Set<string>();
 
-function viewKey(userId: number, postId: number): string {
-  return `${userId}:${postId}`;
+function viewKey(userId: number, postId: number, scope: 'post' | 'circle' = 'post'): string {
+  return `${scope}:${userId}:${postId}`;
 }
 
-export function hasViewedPostForUser(userId: number, postId: number): boolean {
-  const key = viewKey(userId, postId);
+export function hasViewedPostForUser(
+  userId: number,
+  postId: number,
+  scope: 'post' | 'circle' = 'post'
+): boolean {
+  const key = viewKey(userId, postId, scope);
   if (inFlightUserViews.has(key)) return true;
   try {
-    const raw = localStorage.getItem(`htv_viewed_posts_${userId}`);
+    const storageKey =
+      scope === 'circle' ? `htv_viewed_circle_posts_${userId}` : `htv_viewed_posts_${userId}`;
+    const raw = localStorage.getItem(storageKey);
     if (!raw) return false;
     const list = JSON.parse(raw);
     return Array.isArray(list) && list.includes(postId);
@@ -17,10 +23,15 @@ export function hasViewedPostForUser(userId: number, postId: number): boolean {
   }
 }
 
-export function markPostViewedForUser(userId: number, postId: number): void {
-  inFlightUserViews.add(viewKey(userId, postId));
+export function markPostViewedForUser(
+  userId: number,
+  postId: number,
+  scope: 'post' | 'circle' = 'post'
+): void {
+  inFlightUserViews.add(viewKey(userId, postId, scope));
   try {
-    const storageKey = `htv_viewed_posts_${userId}`;
+    const storageKey =
+      scope === 'circle' ? `htv_viewed_circle_posts_${userId}` : `htv_viewed_posts_${userId}`;
     const raw = localStorage.getItem(storageKey);
     const parsed = raw ? JSON.parse(raw) : [];
     const list: number[] = Array.isArray(parsed) ? parsed : [];
@@ -31,6 +42,24 @@ export function markPostViewedForUser(userId: number, postId: number): void {
   } catch {
     // Ignore storage unavailability
   }
+}
+
+export function beginPostViewForUser(
+  userId: number,
+  postId: number,
+  scope: 'post' | 'circle' = 'post'
+): boolean {
+  if (hasViewedPostForUser(userId, postId, scope)) return false;
+  inFlightUserViews.add(viewKey(userId, postId, scope));
+  return true;
+}
+
+export function rollbackPostViewForUser(
+  userId: number,
+  postId: number,
+  scope: 'post' | 'circle' = 'post'
+): void {
+  inFlightUserViews.delete(viewKey(userId, postId, scope));
 }
 
 export function buildPostShareUrl(postId: number): string {

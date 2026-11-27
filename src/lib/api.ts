@@ -1,4 +1,5 @@
 import { classifyAllowedMedia, type MediaCategory } from '../shared/validation';
+import { trackApiLatency } from './perfMonitor';
 
 const TOKEN_KEY = 'htv_token';
 
@@ -32,15 +33,22 @@ export async function apiFetch<T = any>(path: string, init: RequestInit = {}): P
     headers.set('Content-Type', 'application/json');
   }
 
+  const method = String(init.method || 'GET').toUpperCase();
+  const startedAt = typeof performance !== 'undefined' ? performance.now() : 0;
+
   let res: Response;
   try {
     res = await fetch(path, {
       ...init,
       headers,
       credentials: 'include',
+      cache: init.cache ?? (method === 'GET' ? 'no-store' : undefined),
     });
   } catch (err: any) {
     if (err?.name === 'AbortError') throw err;
+    if (typeof performance !== 'undefined') {
+      trackApiLatency(path, method, performance.now() - startedAt, 0, false);
+    }
     const offline = typeof navigator !== 'undefined' && navigator.onLine === false;
     throw new Error(
       offline
@@ -50,6 +58,9 @@ export async function apiFetch<T = any>(path: string, init: RequestInit = {}): P
   }
 
   const data = await res.json().catch(() => ({}));
+  if (typeof performance !== 'undefined') {
+    trackApiLatency(path, method, performance.now() - startedAt, res.status, res.ok);
+  }
   if (!res.ok) {
     throw new Error(data?.error || `Request failed (${res.status})`);
   }

@@ -20,7 +20,11 @@ import {
   MessageCircle,
   MessageSquare,
   MoreVertical,
+  Pause,
+  Pencil,
+  Play,
   Plus,
+  RefreshCw,
   Send,
   Share2,
   Shield,
@@ -34,8 +38,18 @@ import {
   Zap,
 } from 'lucide-react';
 import { Avatar, VerifiedBadge } from './Avatar';
+import { FeedSkeleton } from './FeedSkeleton';
 import { apiFetch, uploadMediaFile } from '../lib/api';
-import { formatCompactViews, formatSafeDate } from '../lib/postSession';
+import { cachedApiFetch, invalidateApiCache } from '../lib/cache';
+import { useRenderPerf } from '../lib/perfMonitor';
+import {
+  beginPostViewForUser,
+  formatCompactViews,
+  formatSafeDate,
+  hasViewedPostForUser,
+  markPostViewedForUser,
+  rollbackPostViewForUser,
+} from '../lib/postSession';
 import {
   countWords,
   MAX_WORDS,
@@ -73,37 +87,6 @@ const ROLE_STYLES: Record<CircleRole, string> = {
   moderator: 'bg-sky-500/15 text-sky-600 dark:text-sky-300 border-sky-500/30',
   member: 'bg-[var(--htv-elevated)] text-[var(--htv-text-dim)] border-[var(--htv-border-subtle)]',
 };
-
-const inFlightCircleViews = new Set<string>();
-
-function hasViewedCirclePost(userId: number, postId: number): boolean {
-  const key = `${userId}:${postId}`;
-  if (inFlightCircleViews.has(key)) return true;
-  try {
-    const raw = localStorage.getItem(`htv_viewed_circle_posts_${userId}`);
-    if (!raw) return false;
-    const list = JSON.parse(raw);
-    return Array.isArray(list) && list.includes(postId);
-  } catch {
-    return false;
-  }
-}
-
-function markCirclePostViewed(userId: number, postId: number): void {
-  inFlightCircleViews.add(`${userId}:${postId}`);
-  try {
-    const storageKey = `htv_viewed_circle_posts_${userId}`;
-    const raw = localStorage.getItem(storageKey);
-    const parsed = raw ? JSON.parse(raw) : [];
-    const list: number[] = Array.isArray(parsed) ? parsed : [];
-    if (!list.includes(postId)) {
-      const next = [...list.slice(-499), postId];
-      localStorage.setItem(storageKey, JSON.stringify(next));
-    }
-  } catch {
-    // Ignore storage unavailability
-  }
-}
 
 function buildCircleInviteUrl(circleId: number, inviteCode: string): string {
   if (typeof window === 'undefined') {
@@ -153,6 +136,7 @@ interface CirclePostCardProps {
   isPendingView?: boolean;
   highlighted?: boolean;
   onOpenProfile: (userId: number) => void;
+  onOpenCircle?: (circleId: number) => void;
   onPostUpdated: (updated: CirclePostItem) => void;
   onViewSynced: (postId: number, viewsCount: number) => void;
   onPostDeleted: (postId: number) => void;
@@ -160,7 +144,7 @@ interface CirclePostCardProps {
   onNotify: (message: string, variant?: 'success' | 'error') => void;
 }
 
-const CirclePostCard: React.FC<CirclePostCardProps> = ({
+const CirclePostCard: React.FC<CirclePostCardProps> = React.memo(({
   post,
   circleId,
   currentUser,
@@ -168,6 +152,7 @@ const CirclePostCard: React.FC<CirclePostCardProps> = ({
   isPendingView = false,
   highlighted = false,
   onOpenProfile,
+  onOpenCircle,
   onPostUpdated,
   onViewSynced,
   onPostDeleted,
@@ -189,7 +174,12 @@ const CirclePostCard: React.FC<CirclePostCardProps> = ({
 
   const isPostOwner = Number(post.user_id) === Number(currentUser.id);
   const isSiteAdmin = String(currentUser.role).toLowerCase() === 'admin';
-  const canDelete = isPostOwner || isCircleStaff || isSiteAdmin;
+  const effectiveCircleStaff =
+    isCircleStaff ||
+    post.circle_viewer_role === 'owner' ||
+    post.circle_viewer_role === 'admin' ||
+    post.circle_viewer_role === 'moderator';
+  const canDelete = isPostOwner || effectiveCircleStaff || isSiteAdmin;
   const canReport = !isPostOwner;
   const hasMenuActions = canDelete || canReport;
   const safeMediaUrl = sanitizeMediaUrl(post.media_url);
@@ -216,9 +206,12 @@ const CirclePostCard: React.FC<CirclePostCardProps> = ({
   useEffect(() => {
     if (isPendingView || post.status !== 'approved') return;
     const node = cardRef.current;
-    if (!node || post.has_viewed || hasViewedCirclePost(currentUser.id, post.id)) {
+    if (!node || post.has_viewed || hasViewedPostForUser(currentUser.id, post.id, 'circle')) {
       if (post.has_viewed) {
-        markCirclePostViewed(currentUser.id, post.id);
+        markPostViewedForUser(currentUser.id, post.id, 'circle');
+        if (post.global_post_id) {
+          markPostViewedForUser(currentUser.id, post.global_post_id, 'post');
+        }
       }
       return;
     }
@@ -229,11 +222,10 @@ const CirclePostCard: React.FC<CirclePostCardProps> = ({
       (entries) => {
         const entry = entries[0];
         if (!entry?.isIntersecting) return;
-        if (post.has_viewed || hasViewedCirclePost(currentUser.id, post.id)) {
+        if (!beginPostViewForUser(currentUser.id, post.id, 'circle')) {
           observer.disconnect();
           return;
         }
-        markCirclePostViewed(currentUser.id, post.id);
         observer.disconnect();
 
         void (async () => {
@@ -242,15 +234,19 @@ const CirclePostCard: React.FC<CirclePostCardProps> = ({
               `/api/circles/${circleId}/posts/${post.id}/view`,
               { method: 'POST' }
             );
+            markPostViewedForUser(currentUser.id, post.id, 'circle');
+            if (post.global_post_id) {
+              markPostViewedForUser(currentUser.id, post.global_post_id, 'post');
+            }
             if (!cancelled && typeof res.views_count === 'number') {
               onViewSynced(post.id, res.views_count);
             }
           } catch {
-            // Keep UI stable if background view sync fails
+            rollbackPostViewForUser(currentUser.id, post.id, 'circle');
           }
         })();
       },
-      { threshold: 0.45 }
+      { threshold: 0.15 }
     );
 
     observer.observe(node);
@@ -258,7 +254,7 @@ const CirclePostCard: React.FC<CirclePostCardProps> = ({
       cancelled = true;
       observer.disconnect();
     };
-  }, [circleId, currentUser.id, isPendingView, onViewSynced, post.has_viewed, post.id, post.status]);
+  }, [circleId, currentUser.id, isPendingView, onViewSynced, post.global_post_id, post.has_viewed, post.id, post.status]);
 
   const handleToggleLike = async () => {
     try {
@@ -404,41 +400,65 @@ const CirclePostCard: React.FC<CirclePostCardProps> = ({
     <article
       ref={cardRef}
       id={`circle-post-${post.id}`}
-      className={`htv-card rounded-2xl p-4 sm:p-5 space-y-3.5 transition-all relative ${
-        menuOpen ? 'z-30' : ''
+      className={`htv-card w-full min-w-0 max-w-full rounded-2xl p-4 sm:p-5 space-y-3.5 transition-all relative ${
+        menuOpen ? 'z-20' : ''
       } ${highlighted ? 'ring-2 ring-emerald-500/70 shadow-lg shadow-emerald-500/10' : ''}`}
     >
+      {/* Aggregated Joined Feed Circle Context Chip */}
+      {post.circle_name && onOpenCircle && (
+        <div className="flex items-center justify-between gap-2 flex-wrap pb-2 border-b border-[var(--htv-border-subtle)] min-w-0">
+          <button
+            type="button"
+            onClick={() => onOpenCircle(post.circle_id)}
+            className="inline-flex items-center gap-2 text-left group cursor-pointer min-w-0 flex-1"
+          >
+            <Avatar src={sanitizeMediaUrl(post.circle_avatar)} name={post.circle_name} size="xs" />
+            <span className="text-xs font-display font-semibold text-purple-600 dark:text-purple-300 group-hover:text-orange-400 truncate">
+              {post.circle_name}
+            </span>
+            {post.circle_category && (
+              <span className="px-2 py-0.5 rounded-full text-[10px] font-medium htv-elevated text-[var(--htv-text-dim)] shrink-0 max-w-[120px] truncate">
+                {post.circle_category}
+              </span>
+            )}
+          </button>
+          <span className="text-[10px] text-[var(--htv-text-dim)] shrink-0 whitespace-nowrap">
+            Joined Circle
+          </span>
+        </div>
+      )}
+
       {/* Header */}
-      <div className="flex items-start justify-between gap-3">
+      <div className="flex items-start justify-between gap-2.5 sm:gap-3 min-w-0">
         <button
           type="button"
           onClick={() => onOpenProfile(post.user_id)}
-          className="flex items-center gap-3 text-left group cursor-pointer min-w-0"
+          className="flex items-center gap-2.5 sm:gap-3 text-left group cursor-pointer min-w-0 flex-1"
         >
           <Avatar src={post.author_avatar} name={post.author_name} size="md" />
-          <div className="min-w-0">
-            <div className="flex items-center gap-1.5 flex-wrap">
-              <span className="font-display font-semibold text-sm group-hover:text-purple-600 dark:group-hover:text-purple-300 transition-colors truncate">
+          <div className="min-w-0 flex-1">
+            <div className="flex items-center gap-1.5 flex-wrap min-w-0">
+              <span className="font-display font-semibold text-sm group-hover:text-purple-600 dark:group-hover:text-purple-300 transition-colors truncate max-w-full">
                 {post.author_name}
               </span>
               <VerifiedBadge verified={post.author_verified} />
               {post.status === 'pending' && (
-                <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-[10px] font-semibold bg-amber-500/15 text-amber-600 dark:text-amber-300 border border-amber-500/30">
-                  <Clock className="w-2.5 h-2.5" />
+                <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-[10px] font-semibold bg-amber-500/15 text-amber-600 dark:text-amber-300 border border-amber-500/30 shrink-0">
+                  <Clock className="w-2.5 h-2.5 shrink-0" />
                   Pending Approval
                 </span>
               )}
               {post.status === 'approved' && post.is_global && (
-                <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-[10px] font-semibold bg-emerald-500/15 text-emerald-700 dark:text-emerald-300 border border-emerald-500/30">
-                  <Globe className="w-2.5 h-2.5" />
+                <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-[10px] font-semibold bg-emerald-500/15 text-emerald-700 dark:text-emerald-300 border border-emerald-500/30 shrink-0">
+                  <Globe className="w-2.5 h-2.5 shrink-0" />
                   Global Feed
                 </span>
               )}
             </div>
-            <div className="flex items-center gap-1.5 text-xs text-[var(--htv-text-dim)] flex-wrap">
-              <span>@{post.author_username}</span>
+            <div className="flex items-center gap-x-1.5 gap-y-0.5 text-xs text-[var(--htv-text-dim)] flex-wrap min-w-0">
+              <span className="truncate max-w-full">@{post.author_username}</span>
               <span aria-hidden="true">·</span>
-              <span className="font-mono-tabular">{formatSafeDate(post.created_at)}</span>
+              <span className="font-mono-tabular shrink-0">{formatSafeDate(post.created_at)}</span>
               {post.status === 'approved' && (post.delivered_count ?? 0) > 0 && (
                 <>
                   <span aria-hidden="true">·</span>
@@ -463,7 +483,7 @@ const CirclePostCard: React.FC<CirclePostCardProps> = ({
               aria-label="Circle post options"
               aria-haspopup="menu"
               aria-expanded={menuOpen}
-              className="p-2 rounded-lg text-[var(--htv-text-dim)] hover:text-[var(--htv-text)] hover:bg-[var(--htv-hover)] transition-colors cursor-pointer"
+              className="min-w-[36px] min-h-[36px] flex items-center justify-center rounded-lg text-[var(--htv-text-dim)] hover:text-[var(--htv-text)] hover:bg-[var(--htv-hover)] transition-colors cursor-pointer"
             >
               <MoreVertical className="w-4 h-4" />
             </button>
@@ -471,7 +491,7 @@ const CirclePostCard: React.FC<CirclePostCardProps> = ({
             {menuOpen && (
               <div
                 role="menu"
-                className="absolute right-0 mt-1.5 w-40 rounded-xl htv-card border border-[var(--htv-border)] shadow-xl py-1 z-40"
+                className="absolute right-0 top-full mt-1.5 w-40 max-w-[calc(100vw-2.5rem)] rounded-xl htv-card border border-[var(--htv-border)] shadow-xl py-1 z-40"
               >
                 {canDelete && (
                   <button
@@ -479,9 +499,9 @@ const CirclePostCard: React.FC<CirclePostCardProps> = ({
                     role="menuitem"
                     disabled={deleting}
                     onClick={handleDelete}
-                    className="w-full px-3.5 py-2 text-left text-xs font-semibold text-rose-600 dark:text-rose-400 hover:bg-rose-500/10 flex items-center gap-2 cursor-pointer disabled:opacity-50"
+                    className="w-full px-3.5 py-2 text-left text-xs font-semibold text-rose-600 dark:text-rose-400 hover:bg-rose-500/10 flex items-center gap-2 whitespace-nowrap cursor-pointer disabled:opacity-50"
                   >
-                    <Trash2 className="w-3.5 h-3.5" />
+                    <Trash2 className="w-3.5 h-3.5 shrink-0" />
                     {deleting ? 'Deleting...' : 'Delete'}
                   </button>
                 )}
@@ -493,9 +513,9 @@ const CirclePostCard: React.FC<CirclePostCardProps> = ({
                       setMenuOpen(false);
                       setReportOpen((prev) => !prev);
                     }}
-                    className="w-full px-3.5 py-2 text-left text-xs font-semibold text-amber-600 dark:text-amber-400 hover:bg-amber-500/10 flex items-center gap-2 cursor-pointer"
+                    className="w-full px-3.5 py-2 text-left text-xs font-semibold text-amber-600 dark:text-amber-400 hover:bg-amber-500/10 flex items-center gap-2 whitespace-nowrap cursor-pointer"
                   >
-                    <Flag className="w-3.5 h-3.5" />
+                    <Flag className="w-3.5 h-3.5 shrink-0" />
                     Report
                   </button>
                 )}
@@ -507,7 +527,7 @@ const CirclePostCard: React.FC<CirclePostCardProps> = ({
 
       {/* Content */}
       {post.content && (
-        <p className="text-[15px] leading-relaxed text-[var(--htv-text)] whitespace-pre-wrap break-words">
+        <p className="text-[15px] leading-relaxed text-[var(--htv-text)] whitespace-pre-wrap break-words [overflow-wrap:anywhere]">
           {post.content}
         </p>
       )}
@@ -530,7 +550,7 @@ const CirclePostCard: React.FC<CirclePostCardProps> = ({
       {canReport && reportOpen && (
         <form
           onSubmit={handleReportSubmit}
-          className="htv-elevated rounded-xl p-3 flex items-center gap-2 flex-wrap"
+          className="htv-elevated rounded-xl p-3 flex flex-col sm:flex-row sm:items-center gap-2 min-w-0"
         >
           <input
             type="text"
@@ -538,12 +558,12 @@ const CirclePostCard: React.FC<CirclePostCardProps> = ({
             onChange={(e) => setReportReason(e.target.value)}
             placeholder="Reason for reporting this Circle post..."
             maxLength={500}
-            className="flex-1 min-w-[180px] h-9 px-3 rounded-lg bg-[var(--htv-input)] border border-[var(--htv-border-subtle)] text-xs text-[var(--htv-text)]"
+            className="w-full sm:flex-1 min-w-0 h-9 px-3 rounded-lg bg-[var(--htv-input)] border border-[var(--htv-border-subtle)] text-xs text-[var(--htv-text)]"
           />
           <button
             type="submit"
             disabled={submittingReport}
-            className="px-3 py-2 rounded-lg bg-amber-600 hover:bg-amber-500 text-white text-xs font-medium cursor-pointer disabled:opacity-50"
+            className="w-full sm:w-auto px-3 py-2 rounded-lg bg-amber-600 hover:bg-amber-500 text-white text-xs font-medium shrink-0 whitespace-nowrap cursor-pointer disabled:opacity-50"
           >
             {submittingReport ? 'Submitting...' : 'Submit Report'}
           </button>
@@ -552,58 +572,58 @@ const CirclePostCard: React.FC<CirclePostCardProps> = ({
 
       {/* Footer: Moderation Controls OR Engagement Bar */}
       {isPendingView && onModerate ? (
-        <div className="flex items-center justify-end gap-2 pt-2 border-t border-[var(--htv-border-subtle)]">
+        <div className="flex items-center justify-end gap-2 flex-wrap pt-2 border-t border-[var(--htv-border-subtle)]">
           <button
             type="button"
             disabled={moderating}
             onClick={() => handleModerateClick('reject')}
-            className="px-3.5 py-2 rounded-lg htv-elevated hover:bg-rose-500/15 text-xs font-semibold text-rose-600 dark:text-rose-300 inline-flex items-center gap-1.5 cursor-pointer disabled:opacity-50"
+            className="px-3.5 py-2 rounded-lg htv-elevated hover:bg-rose-500/15 text-xs font-semibold text-rose-600 dark:text-rose-300 inline-flex items-center gap-1.5 whitespace-nowrap shrink-0 cursor-pointer disabled:opacity-50"
           >
-            <X className="w-3.5 h-3.5" />
+            <X className="w-3.5 h-3.5 shrink-0" />
             Reject
           </button>
           <button
             type="button"
             disabled={moderating}
             onClick={() => handleModerateClick('approve')}
-            className="px-3.5 py-2 rounded-lg bg-gradient-to-r from-emerald-500 to-teal-500 hover:from-emerald-600 hover:to-teal-600 text-white text-xs font-semibold inline-flex items-center gap-1.5 cursor-pointer disabled:opacity-50"
+            className="px-3.5 py-2 rounded-lg bg-gradient-to-r from-emerald-500 to-teal-500 hover:from-emerald-600 hover:to-teal-600 text-white text-xs font-semibold inline-flex items-center gap-1.5 whitespace-nowrap shrink-0 cursor-pointer disabled:opacity-50"
           >
-            <Check className="w-3.5 h-3.5" />
+            <Check className="w-3.5 h-3.5 shrink-0" />
             Approve Post
           </button>
         </div>
       ) : (
         <>
-          <div className="flex items-center justify-between gap-2 pt-2 border-t border-[var(--htv-border-subtle)] flex-wrap">
-            <div className="flex items-center gap-1.5 sm:gap-2">
+          <div className="flex items-center justify-between gap-1.5 sm:gap-2 pt-2 border-t border-[var(--htv-border-subtle)] flex-wrap min-w-0">
+            <div className="flex items-center gap-1 sm:gap-1.5 flex-wrap min-w-0">
               <button
                 type="button"
                 onClick={handleToggleLike}
-                className={`px-3 py-2 rounded-lg text-xs font-medium inline-flex items-center gap-1.5 transition-colors cursor-pointer ${
+                className={`px-2 sm:px-3 py-1.5 sm:py-2 rounded-lg text-xs font-medium inline-flex items-center gap-1 sm:gap-1.5 whitespace-nowrap shrink-0 transition-colors cursor-pointer ${
                   post.is_liked
                     ? 'bg-rose-500/15 text-rose-600 dark:text-rose-400'
                     : 'text-[var(--htv-text-muted)] hover:bg-[var(--htv-hover)]'
                 }`}
               >
-                <Heart className={`w-4 h-4 ${post.is_liked ? 'fill-current' : ''}`} />
+                <Heart className={`w-4 h-4 shrink-0 ${post.is_liked ? 'fill-current' : ''}`} />
                 <span className="font-mono-tabular">{post.likes_count}</span>
               </button>
 
               <button
                 type="button"
                 onClick={() => setCommentsOpen((prev) => !prev)}
-                className="px-3 py-2 rounded-lg text-xs font-medium text-[var(--htv-text-muted)] hover:bg-[var(--htv-hover)] inline-flex items-center gap-1.5 cursor-pointer"
+                className="px-2 sm:px-3 py-1.5 sm:py-2 rounded-lg text-xs font-medium text-[var(--htv-text-muted)] hover:bg-[var(--htv-hover)] inline-flex items-center gap-1 sm:gap-1.5 whitespace-nowrap shrink-0 cursor-pointer"
               >
-                <MessageCircle className="w-4 h-4" />
+                <MessageCircle className="w-4 h-4 shrink-0" />
                 <span className="font-mono-tabular">{post.comments_count}</span>
               </button>
 
               <div
                 aria-label={formattedViews}
                 title={`${post.views_count} unique views`}
-                className="px-2.5 py-2 rounded-lg text-xs font-medium text-[var(--htv-text-dim)] inline-flex items-center gap-1.5 select-none"
+                className="px-2 sm:px-2.5 py-1.5 sm:py-2 rounded-lg text-xs font-medium text-[var(--htv-text-dim)] inline-flex items-center gap-1 sm:gap-1.5 whitespace-nowrap shrink-0 select-none"
               >
-                <Eye className="w-4 h-4" />
+                <Eye className="w-4 h-4 shrink-0" />
                 <span className="font-mono-tabular">{formattedViews}</span>
               </div>
             </div>
@@ -611,9 +631,9 @@ const CirclePostCard: React.FC<CirclePostCardProps> = ({
             <button
               type="button"
               onClick={handleShare}
-              className="px-3 py-2 rounded-lg text-xs font-medium text-[var(--htv-text-muted)] hover:bg-[var(--htv-hover)] hover:text-[var(--htv-text)] inline-flex items-center gap-1.5 cursor-pointer"
+              className="px-2.5 sm:px-3 py-1.5 sm:py-2 rounded-lg text-xs font-medium text-[var(--htv-text-muted)] hover:bg-[var(--htv-hover)] hover:text-[var(--htv-text)] inline-flex items-center gap-1 sm:gap-1.5 whitespace-nowrap shrink-0 cursor-pointer"
             >
-              <Share2 className="w-4 h-4" />
+              <Share2 className="w-4 h-4 shrink-0" />
               <span>Share</span>
               {post.shares_count > 0 && (
                 <span className="font-mono-tabular text-[var(--htv-text-dim)]">
@@ -624,18 +644,18 @@ const CirclePostCard: React.FC<CirclePostCardProps> = ({
           </div>
 
           {commentsOpen && (
-            <div className="pt-3 border-t border-[var(--htv-border-subtle)] space-y-3">
+            <div className="pt-3 border-t border-[var(--htv-border-subtle)] space-y-3 min-w-0">
               {post.comments.length > 0 && (
                 <div className="space-y-2.5 max-h-60 overflow-y-auto pr-1">
                   {post.comments.map((c, idx) => (
-                    <div key={`cc-${c.id}-${idx}`} className="flex items-start gap-2.5">
+                    <div key={`cc-${c.id}-${idx}`} className="flex items-start gap-2.5 min-w-0">
                       <Avatar src={c.author_avatar} name={c.author_name} size="xs" />
                       <div className="htv-elevated rounded-xl px-3 py-2 flex-1 min-w-0">
-                        <div className="flex items-center gap-1.5">
-                          <span className="text-xs font-semibold">{c.author_name}</span>
+                        <div className="flex items-center gap-1.5 flex-wrap min-w-0">
+                          <span className="text-xs font-semibold truncate max-w-full">{c.author_name}</span>
                           <VerifiedBadge verified={c.author_verified} />
                         </div>
-                        <p className="text-xs text-[var(--htv-text)] mt-0.5 break-words">
+                        <p className="text-xs text-[var(--htv-text)] mt-0.5 break-words [overflow-wrap:anywhere]">
                           {c.content}
                         </p>
                       </div>
@@ -644,17 +664,17 @@ const CirclePostCard: React.FC<CirclePostCardProps> = ({
                 </div>
               )}
 
-              <form onSubmit={handleCommentSubmit} className="flex items-center gap-2">
+              <form onSubmit={handleCommentSubmit} className="flex items-center gap-2 min-w-0">
                 <input
                   type="text"
                   value={commentInput}
                   onChange={(e) => setCommentInput(e.target.value)}
                   placeholder="Write a comment (no links allowed)..."
-                  className="flex-1 h-9 px-3 rounded-lg htv-elevated text-xs text-[var(--htv-text)] placeholder:text-[var(--htv-text-dim)] focus:outline-none focus:ring-2 focus:ring-purple-500/40"
+                  className="flex-1 min-w-0 h-9 px-3 rounded-lg htv-elevated text-xs text-[var(--htv-text)] placeholder:text-[var(--htv-text-dim)] focus:outline-none focus:ring-2 focus:ring-purple-500/40"
                 />
                 <button
                   type="submit"
-                  className="htv-gradient-btn px-3 py-2 rounded-lg text-xs font-semibold cursor-pointer"
+                  className="htv-gradient-btn px-3 py-2 rounded-lg text-xs font-semibold shrink-0 whitespace-nowrap cursor-pointer"
                 >
                   Reply
                 </button>
@@ -668,7 +688,9 @@ const CirclePostCard: React.FC<CirclePostCardProps> = ({
       )}
     </article>
   );
-};
+});
+
+CirclePostCard.displayName = 'CirclePostCard';
 
 export const CirclesView: React.FC<CirclesViewProps> = ({
   currentUser,
@@ -678,10 +700,21 @@ export const CirclesView: React.FC<CirclesViewProps> = ({
   onOpenProfile,
   onOpenConversation,
 }) => {
+  useRenderPerf('CirclesView');
   const [circles, setCircles] = useState<CircleItem[]>([]);
-  const [selectedCircleId, setSelectedCircleId] = useState<number | null>(null);
+  const [viewMode, setViewMode] = useState<'aggregated' | 'circle'>(() =>
+    initialCircleId ? 'circle' : 'aggregated'
+  );
+  const [selectedCircleId, setSelectedCircleId] = useState<number | null>(initialCircleId ?? null);
   const [loadingCircles, setLoadingCircles] = useState(true);
   const [loadingDetail, setLoadingDetail] = useState(false);
+
+  // Unified Aggregated Joined Circles Feed state
+  const [aggPosts, setAggPosts] = useState<CirclePostItem[]>([]);
+  const [loadingAgg, setLoadingAgg] = useState(false);
+  const [loadingMoreAgg, setLoadingMoreAgg] = useState(false);
+  const [hasMoreAgg, setHasMoreAgg] = useState(false);
+  const AGG_PAGE_SIZE = 15;
 
   // Active Circle state
   const [activeCircle, setActiveCircle] = useState<CircleItem | null>(null);
@@ -766,16 +799,26 @@ export const CirclesView: React.FC<CirclesViewProps> = ({
   const [autoKeywordEnabled, setAutoKeywordEnabled] = useState(true);
   const [savingAutoSettings, setSavingAutoSettings] = useState(false);
 
-  // Keyword rule form state
+  // Keyword rule form & inline-edit state
   const [newKeyword, setNewKeyword] = useState('');
   const [newKeywordReply, setNewKeywordReply] = useState('');
   const [newKeywordCreateLead, setNewKeywordCreateLead] = useState(true);
   const [addingKeyword, setAddingKeyword] = useState(false);
+  const [editingRuleId, setEditingRuleId] = useState<number | null>(null);
+  const [editRuleKeyword, setEditRuleKeyword] = useState('');
+  const [editRuleReply, setEditRuleReply] = useState('');
+  const [editRuleCreateLead, setEditRuleCreateLead] = useState(true);
+  const [savingRuleEdit, setSavingRuleEdit] = useState(false);
+  const [togglingRuleId, setTogglingRuleId] = useState<number | null>(null);
 
-  // Quick reply template form state
+  // Quick reply template form & inline-edit state
   const [newTemplateTitle, setNewTemplateTitle] = useState('');
   const [newTemplateContent, setNewTemplateContent] = useState('');
   const [addingTemplate, setAddingTemplate] = useState(false);
+  const [editingTemplateId, setEditingTemplateId] = useState<number | null>(null);
+  const [editTemplateTitle, setEditTemplateTitle] = useState('');
+  const [editTemplateContent, setEditTemplateContent] = useState('');
+  const [savingTemplateEdit, setSavingTemplateEdit] = useState(false);
 
   // Sequential follower broadcast state
   const [broadcastMessage, setBroadcastMessage] = useState('');
@@ -807,11 +850,62 @@ export const CirclesView: React.FC<CirclesViewProps> = ({
     []
   );
 
+  const loadAggregatedFeed = useCallback(
+    async (forceRefresh = false) => {
+      setLoadingAgg(true);
+      try {
+        const res = await cachedApiFetch<{ posts: CirclePostItem[]; hasMore: boolean }>(
+          `/api/circles/feed/aggregated?limit=${AGG_PAGE_SIZE}&offset=0`,
+          {
+            userId: currentUser.id,
+            ttlMs: 45_000,
+            forceRefresh,
+            onRevalidated: (fresh) => {
+              setAggPosts(fresh.posts);
+              setHasMoreAgg(Boolean(fresh.hasMore));
+            },
+          }
+        );
+        setAggPosts(res.posts);
+        setHasMoreAgg(Boolean(res.hasMore));
+      } catch (err: any) {
+        showToast(err?.message || 'Could not load Joined Circles feed.', 'error');
+      } finally {
+        setLoadingAgg(false);
+      }
+    },
+    [currentUser.id, showToast]
+  );
+
+  const handleLoadMoreAggregated = async () => {
+    if (loadingMoreAgg || !hasMoreAgg) return;
+    setLoadingMoreAgg(true);
+    try {
+      const res = await apiFetch<{ posts: CirclePostItem[]; hasMore: boolean }>(
+        `/api/circles/feed/aggregated?limit=${AGG_PAGE_SIZE}&offset=${aggPosts.length}`
+      );
+      setAggPosts((prev) => {
+        const seen = new Set(prev.map((p) => p.id));
+        return [...prev, ...res.posts.filter((p) => !seen.has(p.id))];
+      });
+      setHasMoreAgg(Boolean(res.hasMore));
+    } catch (err: any) {
+      showToast(err?.message || 'Could not load more posts.', 'error');
+    } finally {
+      setLoadingMoreAgg(false);
+    }
+  };
+
   const loadCircles = useCallback(
-    async (preferredId?: number | null) => {
+    async (preferredId?: number | null, forceRefresh = false) => {
       setLoadingCircles(true);
       try {
-        const res = await apiFetch<{ circles: CircleItem[] }>('/api/circles');
+        const res = await cachedApiFetch<{ circles: CircleItem[] }>('/api/circles', {
+          userId: currentUser.id,
+          ttlMs: 45_000,
+          forceRefresh,
+          onRevalidated: (fresh) => setCircles(fresh.circles),
+        });
         setCircles(res.circles);
         const targetId =
           preferredId && res.circles.some((c) => c.id === preferredId)
@@ -824,7 +918,7 @@ export const CirclesView: React.FC<CirclesViewProps> = ({
         setLoadingCircles(false);
       }
     },
-    [showToast]
+    [currentUser.id, showToast]
   );
 
   const loadCircleDetail = useCallback(
@@ -870,19 +964,26 @@ export const CirclesView: React.FC<CirclesViewProps> = ({
   useEffect(() => {
     if (initialCircleId) {
       setSelectedCircleId(initialCircleId);
+      setViewMode('circle');
       setTab('feed');
     }
   }, [initialCircleId]);
 
   useEffect(() => {
-    if (selectedCircleId) {
+    if (viewMode === 'aggregated') {
+      void loadAggregatedFeed();
+    }
+  }, [viewMode, loadAggregatedFeed]);
+
+  useEffect(() => {
+    if (viewMode === 'circle' && selectedCircleId) {
       setInquiryOpen(false);
       loadCircleDetail(selectedCircleId);
-    } else {
+    } else if (!selectedCircleId) {
       setActiveCircle(null);
       setAutomationData(null);
     }
-  }, [selectedCircleId, loadCircleDetail]);
+  }, [viewMode, selectedCircleId, loadCircleDetail]);
 
   useEffect(() => {
     if (!highlightedPostId || loadingDetail || tab !== 'feed') return;
@@ -962,7 +1063,9 @@ export const CirclesView: React.FC<CirclesViewProps> = ({
       setNewAvatarUrl('');
       setNewPrivacy('public');
       setNewRequireApproval(false);
-      await loadCircles(res.circle.id);
+      invalidateApiCache(currentUser.id, '/api/circles');
+      setViewMode('circle');
+      await loadCircles(res.circle.id, true);
       setTab('feed');
       showToast(`${res.circle.name} is now live!`, 'success');
     } catch (err: any) {
@@ -980,6 +1083,8 @@ export const CirclesView: React.FC<CirclesViewProps> = ({
         `/api/circles/${activeCircle.id}/follow`,
         { method: 'POST' }
       );
+      invalidateApiCache(currentUser.id, '/api/circles');
+      invalidateApiCache(currentUser.id, '/api/posts');
       await loadCircleDetail(activeCircle.id);
       if (res.following) {
         showToast(`Following ${activeCircle.name}`, 'success');
@@ -1173,6 +1278,8 @@ export const CirclesView: React.FC<CirclesViewProps> = ({
 
       setPostContent('');
       setPostMediaUrl('');
+      invalidateApiCache(currentUser.id, '/api/circles');
+      invalidateApiCache(currentUser.id, '/api/posts');
 
       if (res.status === 'pending') {
         if (res.post && isStaff) {
@@ -1320,12 +1427,59 @@ export const CirclesView: React.FC<CirclesViewProps> = ({
     }
   };
 
+  const handleToggleKeywordRule = async (ruleId: number, currentActive: boolean) => {
+    if (!activeCircle || togglingRuleId) return;
+    setTogglingRuleId(ruleId);
+    try {
+      await apiFetch(`/api/circles/${activeCircle.id}/automation/keywords/${ruleId}`, {
+        method: 'PATCH',
+        body: JSON.stringify({ is_active: !currentActive }),
+      });
+      await loadAutomation(activeCircle.id);
+      showToast(!currentActive ? 'Keyword auto-reply enabled.' : 'Keyword auto-reply paused.', 'success');
+    } catch (err: any) {
+      showToast(err?.message || 'Could not update keyword rule.', 'error');
+    } finally {
+      setTogglingRuleId(null);
+    }
+  };
+
+  const handleSaveEditKeywordRule = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!activeCircle || !editingRuleId || savingRuleEdit) return;
+    const kw = sanitizePlainText(editRuleKeyword, 40).toLowerCase();
+    const reply = sanitizePlainText(editRuleReply, 2000);
+    if (!kw || !reply) {
+      showToast('Enter both a keyword trigger and an auto-reply message.', 'error');
+      return;
+    }
+    setSavingRuleEdit(true);
+    try {
+      await apiFetch(`/api/circles/${activeCircle.id}/automation/keywords/${editingRuleId}`, {
+        method: 'PATCH',
+        body: JSON.stringify({
+          keyword: kw,
+          reply_text: reply,
+          create_inquiry: editRuleCreateLead,
+        }),
+      });
+      setEditingRuleId(null);
+      await loadAutomation(activeCircle.id);
+      showToast(`Updated auto-reply for "${kw}".`, 'success');
+    } catch (err: any) {
+      showToast(err?.message || 'Could not save keyword rule.', 'error');
+    } finally {
+      setSavingRuleEdit(false);
+    }
+  };
+
   const handleDeleteKeywordRule = async (ruleId: number) => {
     if (!activeCircle) return;
     try {
       await apiFetch(`/api/circles/${activeCircle.id}/automation/keywords/${ruleId}`, {
         method: 'DELETE',
       });
+      if (editingRuleId === ruleId) setEditingRuleId(null);
       await loadAutomation(activeCircle.id);
       showToast('Keyword rule removed.', 'success');
     } catch (err: any) {
@@ -1360,12 +1514,38 @@ export const CirclesView: React.FC<CirclesViewProps> = ({
     }
   };
 
+  const handleSaveEditQuickReply = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!activeCircle || !editingTemplateId || savingTemplateEdit) return;
+    const title = sanitizePlainText(editTemplateTitle, 60);
+    const content = sanitizePlainText(editTemplateContent, 2000);
+    if (!title || !content) {
+      showToast('Enter both a template title and reply message.', 'error');
+      return;
+    }
+    setSavingTemplateEdit(true);
+    try {
+      await apiFetch(`/api/circles/${activeCircle.id}/automation/quick-replies/${editingTemplateId}`, {
+        method: 'PATCH',
+        body: JSON.stringify({ title, content }),
+      });
+      setEditingTemplateId(null);
+      await loadAutomation(activeCircle.id);
+      showToast('Quick Reply template updated!', 'success');
+    } catch (err: any) {
+      showToast(err?.message || 'Could not update template.', 'error');
+    } finally {
+      setSavingTemplateEdit(false);
+    }
+  };
+
   const handleDeleteQuickReply = async (replyId: number) => {
     if (!activeCircle) return;
     try {
       await apiFetch(`/api/circles/${activeCircle.id}/automation/quick-replies/${replyId}`, {
         method: 'DELETE',
       });
+      if (editingTemplateId === replyId) setEditingTemplateId(null);
       await loadAutomation(activeCircle.id);
       showToast('Quick Reply deleted.', 'success');
     } catch (err: any) {
@@ -1495,6 +1675,8 @@ export const CirclesView: React.FC<CirclesViewProps> = ({
           body: JSON.stringify({ action }),
         }
       );
+      invalidateApiCache(currentUser.id, '/api/circles');
+      invalidateApiCache(currentUser.id, '/api/posts');
       setPendingPosts((prev) => prev.filter((p) => p.id !== postId));
       if (action === 'approve' && res.post) {
         setPosts((prev) => [res.post!, ...prev]);
@@ -1516,13 +1698,21 @@ export const CirclesView: React.FC<CirclesViewProps> = ({
     }
   };
 
-  const handlePostUpdated = useCallback((updated: CirclePostItem) => {
-    setPosts((prev) => prev.map((p) => (p.id === updated.id ? updated : p)));
-  }, []);
+  const handlePostUpdated = useCallback(
+    (updated: CirclePostItem) => {
+      setPosts((prev) => prev.map((p) => (p.id === updated.id ? updated : p)));
+      invalidateApiCache(currentUser.id, '/api/circles/feed/aggregated');
+    },
+    [currentUser.id]
+  );
 
   const handlePostViewSynced = useCallback((postId: number, viewsCount: number) => {
     setPosts((prev) =>
-      prev.map((p) => (p.id === postId ? { ...p, views_count: viewsCount, has_viewed: true } : p))
+      prev.map((p) =>
+        p.id === postId
+          ? { ...p, views_count: Math.max(p.views_count, viewsCount), has_viewed: true }
+          : p
+      )
     );
   }, []);
 
@@ -1531,6 +1721,9 @@ export const CirclesView: React.FC<CirclesViewProps> = ({
       const wasApproved = posts.some((p) => p.id === postId);
       setPosts((prev) => prev.filter((p) => p.id !== postId));
       setPendingPosts((prev) => prev.filter((p) => p.id !== postId));
+      setAggPosts((prev) => prev.filter((p) => p.id !== postId));
+      invalidateApiCache(currentUser.id, '/api/circles');
+      invalidateApiCache(currentUser.id, '/api/posts');
       if (wasApproved && activeCircle) {
         const cid = activeCircle.id;
         setActiveCircle((prev) =>
@@ -1545,7 +1738,34 @@ export const CirclesView: React.FC<CirclesViewProps> = ({
         );
       }
     },
-    [posts, activeCircle]
+    [posts, activeCircle, currentUser.id]
+  );
+
+  const handleAggPostUpdated = useCallback(
+    (updated: CirclePostItem) => {
+      setAggPosts((prev) => prev.map((p) => (p.id === updated.id ? updated : p)));
+      invalidateApiCache(currentUser.id, '/api/circles/feed/aggregated');
+    },
+    [currentUser.id]
+  );
+
+  const handleAggPostViewSynced = useCallback((postId: number, viewsCount: number) => {
+    setAggPosts((prev) =>
+      prev.map((p) =>
+        p.id === postId
+          ? { ...p, views_count: Math.max(p.views_count, viewsCount), has_viewed: true }
+          : p
+      )
+    );
+  }, []);
+
+  const handleAggPostDeleted = useCallback(
+    (postId: number) => {
+      setAggPosts((prev) => prev.filter((p) => p.id !== postId));
+      invalidateApiCache(currentUser.id, '/api/circles');
+      invalidateApiCache(currentUser.id, '/api/posts');
+    },
+    [currentUser.id]
   );
 
   const wordCount = countWords(postContent);
@@ -1553,11 +1773,11 @@ export const CirclesView: React.FC<CirclesViewProps> = ({
     isStaff && (Boolean(activeCircle?.require_post_approval) || pendingPosts.length > 0);
 
   return (
-    <div className="space-y-5">
+    <div className="space-y-5 min-w-0 w-full">
       {toast && (
         <div
           role="status"
-          className={`fixed bottom-20 lg:bottom-6 right-4 sm:right-6 z-40 rounded-xl border px-4 py-2.5 text-xs font-medium shadow-xl backdrop-blur-md ${
+          className={`fixed bottom-20 lg:bottom-6 right-4 sm:right-6 z-40 max-w-[calc(100vw-2rem)] rounded-xl border px-4 py-2.5 text-xs font-medium shadow-xl backdrop-blur-md ${
             toast.variant === 'error'
               ? 'border-rose-500/40 bg-rose-500/15 text-rose-700 dark:text-rose-200'
               : 'border-emerald-500/40 bg-emerald-500/15 text-emerald-700 dark:text-emerald-200'
@@ -1568,13 +1788,13 @@ export const CirclesView: React.FC<CirclesViewProps> = ({
       )}
 
       {/* Header + Create Circle + Switcher */}
-      <div className="htv-card rounded-2xl p-4 sm:p-5 space-y-4">
-        <div className="flex items-center justify-between gap-3 flex-wrap">
-          <div className="flex items-center gap-3">
+      <div className="htv-card rounded-2xl p-4 sm:p-5 space-y-4 min-w-0 w-full">
+        <div className="flex items-center justify-between gap-3 flex-wrap min-w-0">
+          <div className="flex items-center gap-3 min-w-0 flex-1">
             <div className="w-10 h-10 rounded-xl htv-gradient-btn flex items-center justify-center shrink-0">
               <CircleDot className="w-5 h-5" />
             </div>
-            <div>
+            <div className="min-w-0">
               <h1 className="font-display font-bold text-lg">Circles</h1>
               <p className="text-xs text-[var(--htv-text-dim)]">
                 Follow public or private communities, share gallery posts, and invite friends
@@ -1585,7 +1805,7 @@ export const CirclesView: React.FC<CirclesViewProps> = ({
           <button
             type="button"
             onClick={() => setCreateOpen((prev) => !prev)}
-            className="htv-gradient-btn px-3.5 py-2 rounded-xl text-xs font-semibold inline-flex items-center gap-1.5 cursor-pointer"
+            className="htv-gradient-btn px-3.5 py-2 rounded-xl text-xs font-semibold inline-flex items-center gap-1.5 whitespace-nowrap shrink-0 cursor-pointer"
           >
             {createOpen ? <X className="w-3.5 h-3.5" /> : <Plus className="w-3.5 h-3.5" />}
             {createOpen ? 'Cancel' : 'Create Circle'}
@@ -1726,19 +1946,38 @@ export const CirclesView: React.FC<CirclesViewProps> = ({
 
         {/* Circle Switcher Strip */}
         {loadingCircles ? (
-          <div className="flex gap-2">
-            {[1, 2].map((n) => (
-              <div key={n} className="h-12 w-52 rounded-xl htv-elevated animate-pulse" />
-            ))}
-          </div>
+          <FeedSkeleton variant="switcher" count={3} label="Loading Circles" />
         ) : circles.length === 0 ? (
           <p className="text-xs text-[var(--htv-text-dim)]">
             No Circles yet. Create the first community above!
           </p>
         ) : (
           <div className="flex items-center gap-2 overflow-x-auto pb-1">
+            <button
+              type="button"
+              onClick={() => {
+                setViewMode('aggregated');
+                setInviteOpen(false);
+              }}
+              className={`px-3 py-2 rounded-xl border text-left flex items-center gap-2.5 shrink-0 transition-all cursor-pointer ${
+                viewMode === 'aggregated'
+                  ? 'border-orange-500/50 bg-gradient-to-r from-purple-500/15 to-orange-500/15 shadow-sm'
+                  : 'htv-elevated hover:bg-[var(--htv-hover)]'
+              }`}
+            >
+              <div className="w-8 h-8 rounded-full htv-gradient-btn flex items-center justify-center shrink-0">
+                <Sparkles className="w-4 h-4" />
+              </div>
+              <div className="min-w-0">
+                <p className="text-xs font-semibold whitespace-nowrap">Joined Feed</p>
+                <p className="text-[11px] text-[var(--htv-text-dim)] whitespace-nowrap">
+                  Top &amp; recent posts
+                </p>
+              </div>
+            </button>
+
             {circles.map((circle) => {
-              const selected = circle.id === selectedCircleId;
+              const selected = viewMode === 'circle' && circle.id === selectedCircleId;
               const logoUrl = sanitizeMediaUrl(circle.avatar_url);
               return (
                 <button
@@ -1746,6 +1985,7 @@ export const CirclesView: React.FC<CirclesViewProps> = ({
                   type="button"
                   onClick={() => {
                     setSelectedCircleId(circle.id);
+                    setViewMode('circle');
                     setTab('feed');
                     setInviteOpen(false);
                   }}
@@ -1778,62 +2018,129 @@ export const CirclesView: React.FC<CirclesViewProps> = ({
         )}
       </div>
 
-      {/* Active Circle Workspace */}
-      {loadingDetail && !activeCircle ? (
-        <div className="htv-card rounded-2xl p-8 text-center text-xs text-[var(--htv-text-dim)]">
-          Loading Circle...
-        </div>
-      ) : activeCircle ? (
+      {/* Unified Aggregated Joined Circles Feed */}
+      {viewMode === 'aggregated' ? (
         <div className="space-y-4">
+          <div className="htv-card rounded-2xl px-4 py-3 flex items-center justify-between gap-2 flex-wrap min-w-0">
+            <div className="flex items-center gap-2 text-xs text-[var(--htv-text-muted)] min-w-0 flex-1">
+              <Sparkles className="w-4 h-4 text-orange-400 shrink-0" />
+              <span className="truncate">
+                Unified feed across all your joined Circles — ranked by recency &amp; engagement
+              </span>
+            </div>
+            <button
+              type="button"
+              onClick={() => loadAggregatedFeed(true)}
+              disabled={loadingAgg}
+              className="px-3 py-1.5 rounded-lg htv-elevated hover:bg-[var(--htv-hover)] text-xs font-semibold inline-flex items-center gap-1.5 whitespace-nowrap shrink-0 ml-auto cursor-pointer disabled:opacity-50"
+            >
+              <RefreshCw className={`w-3.5 h-3.5 shrink-0 ${loadingAgg ? 'animate-spin' : ''}`} />
+              Refresh
+            </button>
+          </div>
+
+          {loadingAgg && aggPosts.length === 0 ? (
+            <FeedSkeleton variant="aggregated" count={3} label="Loading joined Circles feed" />
+          ) : aggPosts.length === 0 ? (
+            <div className="htv-card rounded-2xl p-8 text-center space-y-2">
+              <p className="font-display font-semibold text-sm">No posts from your Circles yet</p>
+              <p className="text-xs text-[var(--htv-text-dim)]">
+                Follow a Circle in the strip above or create your own to see updates here.
+              </p>
+            </div>
+          ) : (
+            <div className="space-y-4">
+              {aggPosts.map((post) => (
+                <CirclePostCard
+                  key={`agg-${post.id}`}
+                  post={post}
+                  circleId={post.circle_id}
+                  currentUser={currentUser}
+                  isCircleStaff={
+                    post.circle_viewer_role === 'owner' ||
+                    post.circle_viewer_role === 'admin' ||
+                    post.circle_viewer_role === 'moderator'
+                  }
+                  onOpenProfile={onOpenProfile}
+                  onOpenCircle={(cid) => {
+                    setSelectedCircleId(cid);
+                    setViewMode('circle');
+                    setTab('feed');
+                  }}
+                  onPostUpdated={handleAggPostUpdated}
+                  onViewSynced={handleAggPostViewSynced}
+                  onPostDeleted={handleAggPostDeleted}
+                  onNotify={showToast}
+                />
+              ))}
+              {hasMoreAgg && (
+                <div className="flex justify-center pt-1">
+                  <button
+                    type="button"
+                    disabled={loadingMoreAgg}
+                    onClick={handleLoadMoreAggregated}
+                    className="px-5 py-2.5 rounded-xl htv-card hover:bg-[var(--htv-hover)] text-xs font-semibold text-purple-600 dark:text-purple-300 cursor-pointer disabled:opacity-50"
+                  >
+                    {loadingMoreAgg ? 'Loading more...' : 'Load More Posts'}
+                  </button>
+                </div>
+              )}
+            </div>
+          )}
+        </div>
+      ) : loadingDetail && !activeCircle ? (
+        <FeedSkeleton variant="circle-workspace" label="Loading Circle" />
+      ) : activeCircle ? (
+        <div className="space-y-4 min-w-0 w-full">
           {/* Selected Circle Banner & Actions */}
-          <div className="htv-card rounded-2xl p-4 sm:p-5 space-y-4">
-            <div className="flex items-start justify-between gap-3 flex-wrap">
-              <div className="flex items-start gap-3.5 min-w-0">
+          <div className="htv-card rounded-2xl p-4 sm:p-5 space-y-4 min-w-0 w-full">
+            <div className="flex items-start justify-between gap-3 flex-wrap min-w-0">
+              <div className="flex items-start gap-3.5 min-w-0 flex-1 basis-56">
                 <Avatar
                   src={sanitizeMediaUrl(activeCircle.avatar_url)}
                   name={activeCircle.name}
                   size="lg"
                 />
-                <div className="min-w-0 space-y-1">
-                  <div className="flex items-center gap-2 flex-wrap">
-                    <h2 className="font-display font-bold text-base">{activeCircle.name}</h2>
-                    <span className="px-2 py-0.5 rounded-full text-[11px] font-medium bg-purple-500/15 text-purple-600 dark:text-purple-300 border border-purple-500/25">
+                <div className="min-w-0 flex-1 space-y-1">
+                  <div className="flex items-center gap-2 flex-wrap min-w-0">
+                    <h2 className="font-display font-bold text-base break-words">{activeCircle.name}</h2>
+                    <span className="px-2 py-0.5 rounded-full text-[11px] font-medium bg-purple-500/15 text-purple-600 dark:text-purple-300 border border-purple-500/25 max-w-full truncate">
                       {activeCircle.category}
                     </span>
                     <span
-                      className={`inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-[11px] font-semibold border ${
+                      className={`inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-[11px] font-semibold border shrink-0 ${
                         activeCircle.privacy === 'private'
                           ? 'bg-amber-500/15 text-amber-600 dark:text-amber-300 border-amber-500/30'
                           : 'bg-emerald-500/15 text-emerald-700 dark:text-emerald-300 border-emerald-500/30'
                       }`}
                     >
                       {activeCircle.privacy === 'private' ? (
-                        <Lock className="w-3 h-3" />
+                        <Lock className="w-3 h-3 shrink-0" />
                       ) : (
-                        <Globe className="w-3 h-3" />
+                        <Globe className="w-3 h-3 shrink-0" />
                       )}
                       {activeCircle.privacy === 'private' ? 'Private' : 'Public'}
                     </span>
                     {activeCircle.require_post_approval && (
-                      <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-[11px] font-medium bg-sky-500/15 text-sky-600 dark:text-sky-300 border border-sky-500/25">
-                        <ShieldCheck className="w-3 h-3" />
+                      <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-[11px] font-medium bg-sky-500/15 text-sky-600 dark:text-sky-300 border border-sky-500/25 shrink-0">
+                        <ShieldCheck className="w-3 h-3 shrink-0" />
                         Post Approval On
                       </span>
                     )}
                     {viewerRole && (
                       <span
-                        className={`px-2 py-0.5 rounded-full text-[11px] font-semibold border capitalize ${ROLE_STYLES[viewerRole]}`}
+                        className={`px-2 py-0.5 rounded-full text-[11px] font-semibold border capitalize shrink-0 ${ROLE_STYLES[viewerRole]}`}
                       >
                         {viewerRole}
                       </span>
                     )}
                   </div>
                   {activeCircle.description && (
-                    <p className="text-xs text-[var(--htv-text-muted)] leading-relaxed">
+                    <p className="text-xs text-[var(--htv-text-muted)] leading-relaxed break-words [overflow-wrap:anywhere]">
                       {activeCircle.description}
                     </p>
                   )}
-                  <p className="text-[11px] text-[var(--htv-text-dim)]">
+                  <p className="text-[11px] text-[var(--htv-text-dim)] break-words">
                     Created by @{activeCircle.owner_username} · {activeCircle.member_count}{' '}
                     members · {activeCircle.post_count} posts
                   </p>
@@ -1841,13 +2148,13 @@ export const CirclesView: React.FC<CirclesViewProps> = ({
               </div>
 
               {/* Follow / Following (Emerald-Teal) + Quick Inquiry + Prominent Invite Button */}
-              <div className="flex items-center gap-2 flex-wrap">
+              <div className="flex items-center gap-2 flex-wrap max-w-full">
                 {!isOwner && (
                   <button
                     type="button"
                     disabled={followBusy}
                     onClick={handleFollowToggle}
-                    className={`px-4 py-2 rounded-xl text-xs font-semibold inline-flex items-center gap-1.5 transition-all cursor-pointer disabled:opacity-60 ${
+                    className={`px-4 py-2 rounded-xl text-xs font-semibold inline-flex items-center gap-1.5 whitespace-nowrap shrink-0 transition-all cursor-pointer disabled:opacity-60 ${
                       activeCircle.is_member || activeCircle.pending_request
                         ? 'border border-emerald-500/45 bg-emerald-500/15 text-emerald-700 dark:text-emerald-300 hover:bg-emerald-500/25'
                         : 'bg-gradient-to-r from-emerald-500 to-teal-500 hover:from-emerald-600 hover:to-teal-600 text-white shadow-sm shadow-emerald-500/20'
@@ -1855,22 +2162,22 @@ export const CirclesView: React.FC<CirclesViewProps> = ({
                   >
                     {activeCircle.is_member ? (
                       <>
-                        <UserCheck className="w-3.5 h-3.5" />
+                        <UserCheck className="w-3.5 h-3.5 shrink-0" />
                         Following
                       </>
                     ) : activeCircle.pending_request ? (
                       <>
-                        <Clock className="w-3.5 h-3.5" />
+                        <Clock className="w-3.5 h-3.5 shrink-0" />
                         Requested
                       </>
                     ) : activeCircle.privacy === 'private' ? (
                       <>
-                        <Lock className="w-3.5 h-3.5" />
+                        <Lock className="w-3.5 h-3.5 shrink-0" />
                         Request Access
                       </>
                     ) : (
                       <>
-                        <UserPlus className="w-3.5 h-3.5" />
+                        <UserPlus className="w-3.5 h-3.5 shrink-0" />
                         Follow
                       </>
                     )}
@@ -1881,9 +2188,9 @@ export const CirclesView: React.FC<CirclesViewProps> = ({
                   <button
                     type="button"
                     onClick={() => setInquiryOpen((prev) => !prev)}
-                    className="px-3.5 py-2 rounded-xl border border-orange-500/35 bg-orange-500/10 hover:bg-orange-500/20 text-orange-600 dark:text-orange-300 text-xs font-semibold inline-flex items-center gap-1.5 cursor-pointer"
+                    className="px-3.5 py-2 rounded-xl border border-orange-500/35 bg-orange-500/10 hover:bg-orange-500/20 text-orange-600 dark:text-orange-300 text-xs font-semibold inline-flex items-center gap-1.5 whitespace-nowrap shrink-0 cursor-pointer"
                   >
-                    <MessageSquare className="w-3.5 h-3.5" />
+                    <MessageSquare className="w-3.5 h-3.5 shrink-0" />
                     Quick Inquiry
                   </button>
                 )}
@@ -1892,9 +2199,9 @@ export const CirclesView: React.FC<CirclesViewProps> = ({
                   <button
                     type="button"
                     onClick={() => setInviteOpen((prev) => !prev)}
-                    className="htv-gradient-btn px-4 py-2 rounded-xl text-xs font-semibold inline-flex items-center gap-1.5 cursor-pointer"
+                    className="htv-gradient-btn px-4 py-2 rounded-xl text-xs font-semibold inline-flex items-center gap-1.5 whitespace-nowrap shrink-0 cursor-pointer"
                   >
-                    <Link2 className="w-3.5 h-3.5" />
+                    <Link2 className="w-3.5 h-3.5 shrink-0" />
                     Invite
                   </button>
                 )}
@@ -1960,13 +2267,13 @@ export const CirclesView: React.FC<CirclesViewProps> = ({
                   </button>
                 </div>
 
-                <form onSubmit={handleInviteMember} className="flex items-center gap-2 flex-wrap">
+                <form onSubmit={handleInviteMember} className="flex items-center gap-2 flex-wrap min-w-0">
                   <input
                     type="text"
                     value={inviteUsername}
                     onChange={(e) => setInviteUsername(e.target.value)}
                     placeholder="Invite user by @username..."
-                    className="flex-1 min-w-[160px] h-9 px-3 rounded-lg bg-[var(--htv-input)] border border-[var(--htv-border-subtle)] text-xs text-[var(--htv-text)]"
+                    className="w-full sm:w-auto sm:flex-1 min-w-0 h-9 px-3 rounded-lg bg-[var(--htv-input)] border border-[var(--htv-border-subtle)] text-xs text-[var(--htv-text)]"
                   />
                   {isAdminOrOwner && (
                     <select
@@ -1975,7 +2282,7 @@ export const CirclesView: React.FC<CirclesViewProps> = ({
                         setInviteRole(e.target.value as 'member' | 'moderator' | 'admin')
                       }
                       aria-label="Invited member role"
-                      className="h-9 px-2.5 rounded-lg bg-[var(--htv-input)] border border-[var(--htv-border-subtle)] text-xs text-[var(--htv-text)]"
+                      className="h-9 px-2.5 rounded-lg bg-[var(--htv-input)] border border-[var(--htv-border-subtle)] text-xs text-[var(--htv-text)] shrink-0"
                     >
                       <option value="member">Member</option>
                       <option value="moderator">Moderator</option>
@@ -1985,9 +2292,9 @@ export const CirclesView: React.FC<CirclesViewProps> = ({
                   <button
                     type="submit"
                     disabled={inviting}
-                    className="bg-gradient-to-r from-emerald-500 to-teal-500 hover:from-emerald-600 hover:to-teal-600 text-white h-9 px-3.5 rounded-lg text-xs font-semibold inline-flex items-center gap-1.5 cursor-pointer disabled:opacity-50"
+                    className="bg-gradient-to-r from-emerald-500 to-teal-500 hover:from-emerald-600 hover:to-teal-600 text-white h-9 px-3.5 rounded-lg text-xs font-semibold inline-flex items-center gap-1.5 whitespace-nowrap shrink-0 cursor-pointer disabled:opacity-50"
                   >
-                    <UserPlus className="w-3.5 h-3.5" />
+                    <UserPlus className="w-3.5 h-3.5 shrink-0" />
                     {inviting ? 'Inviting...' : 'Send Invite'}
                   </button>
                 </form>
@@ -2117,15 +2424,15 @@ export const CirclesView: React.FC<CirclesViewProps> = ({
               {tab === 'feed' && (
                 <div className="space-y-4">
                   {highlightedPostId && (
-                    <div className="rounded-xl border border-emerald-500/35 bg-emerald-500/10 px-4 py-2.5 flex items-center justify-between gap-2 text-xs">
-                      <span className="text-emerald-700 dark:text-emerald-200 font-medium">
+                    <div className="rounded-xl border border-emerald-500/35 bg-emerald-500/10 px-4 py-2.5 flex items-center justify-between gap-2 flex-wrap min-w-0 text-xs">
+                      <span className="text-emerald-700 dark:text-emerald-200 font-medium min-w-0 break-words">
                         Viewing shared Circle post #{highlightedPostId}
                       </span>
                       {onClearHighlightedPost && (
                         <button
                           type="button"
                           onClick={onClearHighlightedPost}
-                          className="px-2.5 py-1 rounded-lg htv-elevated hover:bg-[var(--htv-hover)] text-[11px] font-semibold cursor-pointer"
+                          className="px-2.5 py-1 rounded-lg htv-elevated hover:bg-[var(--htv-hover)] text-[11px] font-semibold shrink-0 whitespace-nowrap ml-auto cursor-pointer"
                         >
                           Clear
                         </button>
@@ -2195,8 +2502,8 @@ export const CirclesView: React.FC<CirclesViewProps> = ({
                         </p>
                       )}
 
-                      <div className="flex items-center justify-between gap-2 pt-2 border-t border-[var(--htv-border-subtle)] flex-wrap">
-                        <div className="flex items-center gap-2.5 flex-wrap">
+                      <div className="flex items-center justify-between gap-2 pt-2 border-t border-[var(--htv-border-subtle)] flex-wrap min-w-0">
+                        <div className="flex items-center gap-2.5 flex-wrap min-w-0 max-w-full">
                           <input
                             ref={postPhotoRef}
                             type="file"
@@ -2214,27 +2521,27 @@ export const CirclesView: React.FC<CirclesViewProps> = ({
                             type="button"
                             disabled={uploadingPostPhoto}
                             onClick={() => postPhotoRef.current?.click()}
-                            className="px-3.5 py-2 rounded-lg htv-elevated hover:bg-[var(--htv-hover)] text-xs font-medium text-[var(--htv-text-muted)] hover:text-[var(--htv-text)] inline-flex items-center gap-1.5 cursor-pointer disabled:opacity-50"
+                            className="px-3.5 py-2 rounded-lg htv-elevated hover:bg-[var(--htv-hover)] text-xs font-medium text-[var(--htv-text-muted)] hover:text-[var(--htv-text)] inline-flex items-center gap-1.5 whitespace-nowrap shrink-0 cursor-pointer disabled:opacity-50"
                           >
-                            <ImageIcon className="w-4 h-4 text-purple-500 dark:text-purple-400" />
+                            <ImageIcon className="w-4 h-4 text-purple-500 dark:text-purple-400 shrink-0" />
                             {uploadingPostPhoto ? 'Uploading...' : 'Gallery Photo'}
                           </button>
 
                           {activeCircle.privacy === 'public' ? (
-                            <label className="inline-flex items-center gap-2 px-2.5 py-1.5 rounded-lg htv-elevated text-[11px] font-medium text-[var(--htv-text-muted)] cursor-pointer select-none">
+                            <label className="inline-flex items-center gap-2 px-2.5 py-1.5 rounded-lg htv-elevated text-[11px] font-medium text-[var(--htv-text-muted)] cursor-pointer select-none max-w-full">
                               <input
                                 type="checkbox"
                                 checked={broadcastGlobal}
                                 onChange={(e) => setBroadcastGlobal(e.target.checked)}
-                                className="w-3.5 h-3.5 accent-emerald-500 cursor-pointer"
+                                className="w-3.5 h-3.5 accent-emerald-500 cursor-pointer shrink-0"
                               />
                               <Globe className="w-3.5 h-3.5 text-emerald-500 shrink-0" />
-                              <span>Broadcast to Global Feed & followers</span>
+                              <span className="min-w-0 break-words">Broadcast to Global Feed & followers</span>
                             </label>
                           ) : (
-                            <span className="inline-flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg htv-elevated text-[11px] font-medium text-amber-600 dark:text-amber-300">
+                            <span className="inline-flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg htv-elevated text-[11px] font-medium text-amber-600 dark:text-amber-300 max-w-full">
                               <Lock className="w-3 h-3 shrink-0" />
-                              Delivers sequentially to Circle followers only
+                              <span>Delivers sequentially to Circle followers only</span>
                             </span>
                           )}
                         </div>
@@ -2242,9 +2549,9 @@ export const CirclesView: React.FC<CirclesViewProps> = ({
                         <button
                           type="submit"
                           disabled={publishingPost || uploadingPostPhoto}
-                          className="htv-gradient-btn px-4 py-2 rounded-xl text-xs font-semibold inline-flex items-center gap-1.5 cursor-pointer disabled:opacity-50"
+                          className="htv-gradient-btn px-4 py-2 rounded-xl text-xs font-semibold inline-flex items-center gap-1.5 whitespace-nowrap shrink-0 cursor-pointer disabled:opacity-50"
                         >
-                          <Send className="w-3.5 h-3.5" />
+                          <Send className="w-3.5 h-3.5 shrink-0" />
                           {publishingPost ? 'Posting...' : 'Post to Circle'}
                         </button>
                       </div>
@@ -2443,12 +2750,12 @@ export const CirclesView: React.FC<CirclesViewProps> = ({
                         return (
                           <div
                             key={mem.user_id}
-                            className="flex items-center justify-between gap-2 p-2.5 rounded-xl htv-elevated"
+                            className="flex items-center justify-between gap-2 p-2.5 rounded-xl htv-elevated flex-wrap sm:flex-nowrap min-w-0"
                           >
                             <button
                               type="button"
                               onClick={() => onOpenProfile(mem.user_id)}
-                              className="flex items-center gap-2.5 min-w-0 text-left cursor-pointer"
+                              className="flex items-center gap-2.5 min-w-0 flex-1 text-left cursor-pointer"
                             >
                               <Avatar
                                 src={mem.avatar_url}
@@ -2468,7 +2775,7 @@ export const CirclesView: React.FC<CirclesViewProps> = ({
                               </div>
                             </button>
 
-                            <div className="flex items-center gap-2 shrink-0">
+                            <div className="flex items-center gap-2 shrink-0 ml-auto">
                               {canManageMember ? (
                                 <>
                                   <select
@@ -2627,30 +2934,30 @@ export const CirclesView: React.FC<CirclesViewProps> = ({
                                 {filtered.map((inq) => (
                                   <div
                                     key={inq.id}
-                                    className="htv-elevated rounded-xl p-3.5 space-y-2.5 border border-[var(--htv-border-subtle)]"
+                                    className="htv-elevated rounded-xl p-3.5 space-y-2.5 border border-[var(--htv-border-subtle)] min-w-0"
                                   >
-                                    <div className="flex items-start justify-between gap-2 flex-wrap">
+                                    <div className="flex items-start justify-between gap-2 flex-wrap min-w-0">
                                       <button
                                         type="button"
                                         onClick={() => onOpenProfile(inq.customer_id)}
-                                        className="flex items-center gap-2.5 text-left min-w-0 cursor-pointer"
+                                        className="flex items-center gap-2.5 text-left min-w-0 flex-1 cursor-pointer"
                                       >
                                         <Avatar
                                           src={inq.customer_avatar}
                                           name={inq.customer_name}
                                           size="sm"
                                         />
-                                        <div className="min-w-0">
-                                          <div className="flex items-center gap-1.5 flex-wrap">
-                                            <span className="text-xs font-semibold truncate">
+                                        <div className="min-w-0 flex-1">
+                                          <div className="flex items-center gap-1.5 flex-wrap min-w-0">
+                                            <span className="text-xs font-semibold truncate max-w-full">
                                               {inq.customer_name}
                                             </span>
                                             <VerifiedBadge verified={inq.customer_verified} />
-                                            <span className="text-[11px] text-[var(--htv-text-dim)]">
+                                            <span className="text-[11px] text-[var(--htv-text-dim)] truncate max-w-full">
                                               @{inq.customer_username}
                                             </span>
                                           </div>
-                                          <div className="flex items-center gap-1.5 text-[10px] text-[var(--htv-text-dim)]">
+                                          <div className="flex items-center gap-1.5 text-[10px] text-[var(--htv-text-dim)] flex-wrap">
                                             <span>{inq.source.replace('_', ' ')}</span>
                                             <span>·</span>
                                             <span>{formatSafeDate(inq.created_at)}</span>
@@ -2658,9 +2965,9 @@ export const CirclesView: React.FC<CirclesViewProps> = ({
                                         </div>
                                       </button>
 
-                                      <div className="flex items-center gap-1.5 shrink-0">
+                                      <div className="flex items-center gap-1.5 shrink-0 flex-wrap">
                                         <span
-                                          className={`px-2 py-0.5 rounded-full text-[10px] font-semibold border capitalize ${
+                                          className={`px-2 py-0.5 rounded-full text-[10px] font-semibold border capitalize whitespace-nowrap shrink-0 ${
                                             inq.status === 'resolved'
                                               ? 'bg-emerald-500/15 text-emerald-500 border-emerald-500/30'
                                               : inq.status === 'in_progress'
@@ -2674,7 +2981,7 @@ export const CirclesView: React.FC<CirclesViewProps> = ({
                                           <button
                                             type="button"
                                             onClick={() => onOpenConversation(inq.conversation_id!)}
-                                            className="px-2.5 py-1 rounded-lg bg-purple-500/15 text-purple-600 dark:text-purple-300 hover:bg-purple-500/25 text-[11px] font-semibold cursor-pointer"
+                                            className="px-2.5 py-1 rounded-lg bg-purple-500/15 text-purple-600 dark:text-purple-300 hover:bg-purple-500/25 text-[11px] font-semibold whitespace-nowrap shrink-0 cursor-pointer"
                                           >
                                             Open Chat
                                           </button>
@@ -2682,12 +2989,12 @@ export const CirclesView: React.FC<CirclesViewProps> = ({
                                       </div>
                                     </div>
 
-                                    <p className="text-xs text-[var(--htv-text)] bg-[var(--htv-surface)] rounded-lg px-3 py-2 break-words">
+                                    <p className="text-xs text-[var(--htv-text)] bg-[var(--htv-surface)] rounded-lg px-3 py-2 break-words [overflow-wrap:anywhere]">
                                       {inq.message}
                                     </p>
 
                                     {inq.last_reply && (
-                                      <p className="text-[11px] text-emerald-600 dark:text-emerald-300 px-1">
+                                      <p className="text-[11px] text-emerald-600 dark:text-emerald-300 px-1 break-words [overflow-wrap:anywhere]">
                                         Last reply{inq.handled_by_name ? ` (${inq.handled_by_name})` : ''}:{' '}
                                         {inq.last_reply}
                                       </p>
@@ -2695,8 +3002,8 @@ export const CirclesView: React.FC<CirclesViewProps> = ({
 
                                     {/* 1-Tap Quick Reply Templates */}
                                     {(automationData?.quick_replies.length ?? 0) > 0 && (
-                                      <div className="flex items-center gap-1.5 flex-wrap">
-                                        <span className="text-[10px] font-semibold text-[var(--htv-text-dim)] uppercase tracking-wide">
+                                      <div className="flex items-center gap-1.5 flex-wrap min-w-0">
+                                        <span className="text-[10px] font-semibold text-[var(--htv-text-dim)] uppercase tracking-wide shrink-0">
                                           1-Tap Reply:
                                         </span>
                                         {automationData?.quick_replies.map((tmpl) => (
@@ -2710,7 +3017,7 @@ export const CirclesView: React.FC<CirclesViewProps> = ({
                                                 status: 'resolved',
                                               })
                                             }
-                                            className="px-2.5 py-1 rounded-lg bg-[var(--htv-surface)] border border-purple-500/25 hover:border-orange-500/45 text-[11px] font-semibold text-purple-600 dark:text-purple-300 cursor-pointer disabled:opacity-50"
+                                            className="px-2.5 py-1 rounded-lg bg-[var(--htv-surface)] border border-purple-500/25 hover:border-orange-500/45 text-[11px] font-semibold text-purple-600 dark:text-purple-300 max-w-full truncate cursor-pointer disabled:opacity-50"
                                           >
                                             {tmpl.title}
                                           </button>
@@ -2718,7 +3025,7 @@ export const CirclesView: React.FC<CirclesViewProps> = ({
                                       </div>
                                     )}
 
-                                    <div className="flex items-center gap-2 flex-wrap">
+                                    <div className="flex items-center gap-2 flex-wrap min-w-0">
                                       <input
                                         type="text"
                                         value={replyDrafts[inq.id] || ''}
@@ -2729,7 +3036,7 @@ export const CirclesView: React.FC<CirclesViewProps> = ({
                                           }))
                                         }
                                         placeholder="Send direct reply to customer Messenger..."
-                                        className="flex-1 min-w-[180px] h-8 px-3 rounded-lg bg-[var(--htv-input)] border border-[var(--htv-border-subtle)] text-xs text-[var(--htv-text)]"
+                                        className="w-full sm:w-auto sm:flex-1 min-w-0 h-8 px-3 rounded-lg bg-[var(--htv-input)] border border-[var(--htv-border-subtle)] text-xs text-[var(--htv-text)]"
                                       />
                                       <button
                                         type="button"
@@ -2737,9 +3044,9 @@ export const CirclesView: React.FC<CirclesViewProps> = ({
                                         onClick={() =>
                                           handleReplyInquiry(inq.id, { status: 'resolved' })
                                         }
-                                        className="htv-gradient-btn h-8 px-3 rounded-lg text-[11px] font-semibold inline-flex items-center gap-1 cursor-pointer disabled:opacity-50"
+                                        className="htv-gradient-btn h-8 px-3 rounded-lg text-[11px] font-semibold inline-flex items-center gap-1 whitespace-nowrap shrink-0 cursor-pointer disabled:opacity-50"
                                       >
-                                        <Send className="w-3 h-3" />
+                                        <Send className="w-3 h-3 shrink-0" />
                                         Reply
                                       </button>
                                       {inq.status !== 'resolved' && (
@@ -2752,7 +3059,7 @@ export const CirclesView: React.FC<CirclesViewProps> = ({
                                               status: 'resolved',
                                             })
                                           }
-                                          className="h-8 px-2.5 rounded-lg bg-emerald-500/15 text-emerald-500 hover:bg-emerald-500/25 text-[11px] font-semibold cursor-pointer disabled:opacity-50"
+                                          className="h-8 px-2.5 rounded-lg bg-emerald-500/15 text-emerald-500 hover:bg-emerald-500/25 text-[11px] font-semibold whitespace-nowrap shrink-0 cursor-pointer disabled:opacity-50"
                                         >
                                           Resolve
                                         </button>
@@ -3030,41 +3337,148 @@ export const CirclesView: React.FC<CirclesViewProps> = ({
                             )}
 
                             <div className="space-y-2">
-                              {(automationData?.keyword_rules || []).map((rule) => (
-                                <div
-                                  key={rule.id}
-                                  className="flex items-start justify-between gap-2 p-3 rounded-xl htv-elevated"
-                                >
-                                  <div className="min-w-0 space-y-1">
-                                    <div className="flex items-center gap-2 flex-wrap">
-                                      <span className="px-2 py-0.5 rounded-md bg-orange-500/15 text-orange-500 text-[11px] font-semibold font-mono-tabular">
-                                        "{rule.keyword}"
-                                      </span>
-                                      <span className="text-[11px] text-[var(--htv-text-dim)]">
-                                        {rule.hit_count} triggers
-                                      </span>
-                                      {rule.create_inquiry && (
-                                        <span className="text-[10px] text-emerald-500 font-medium">
-                                          · Auto-Lead + DM
-                                        </span>
-                                      )}
-                                    </div>
-                                    <p className="text-xs text-[var(--htv-text)] break-words">
-                                      {rule.reply_text}
-                                    </p>
-                                  </div>
-                                  {isAdminOrOwner && (
-                                    <button
-                                      type="button"
-                                      onClick={() => handleDeleteKeywordRule(rule.id)}
-                                      aria-label={`Delete keyword rule ${rule.keyword}`}
-                                      className="p-1.5 rounded-lg text-rose-500 hover:bg-rose-500/10 cursor-pointer shrink-0"
+                              {(automationData?.keyword_rules || []).map((rule) => {
+                                const isEditing = editingRuleId === rule.id;
+                                const isActive = rule.is_active !== false;
+                                if (isEditing) {
+                                  return (
+                                    <form
+                                      key={rule.id}
+                                      onSubmit={handleSaveEditKeywordRule}
+                                      className="p-3 rounded-xl htv-elevated border border-purple-500/35 space-y-2.5"
                                     >
-                                      <Trash2 className="w-3.5 h-3.5" />
-                                    </button>
-                                  )}
-                                </div>
-                              ))}
+                                      <div className="grid grid-cols-1 sm:grid-cols-3 gap-2">
+                                        <input
+                                          type="text"
+                                          value={editRuleKeyword}
+                                          onChange={(e) => setEditRuleKeyword(e.target.value)}
+                                          placeholder="Trigger keyword"
+                                          maxLength={40}
+                                          className="h-9 px-3 rounded-lg bg-[var(--htv-input)] border border-[var(--htv-border-subtle)] text-xs text-[var(--htv-text)]"
+                                        />
+                                        <input
+                                          type="text"
+                                          value={editRuleReply}
+                                          onChange={(e) => setEditRuleReply(e.target.value)}
+                                          placeholder="Auto-reply message..."
+                                          maxLength={2000}
+                                          className="sm:col-span-2 h-9 px-3 rounded-lg bg-[var(--htv-input)] border border-[var(--htv-border-subtle)] text-xs text-[var(--htv-text)]"
+                                        />
+                                      </div>
+                                      <div className="flex items-center justify-between gap-2 flex-wrap">
+                                        <label className="inline-flex items-center gap-2 text-[11px] text-[var(--htv-text-muted)] cursor-pointer">
+                                          <input
+                                            type="checkbox"
+                                            checked={editRuleCreateLead}
+                                            onChange={(e) => setEditRuleCreateLead(e.target.checked)}
+                                            className="w-3.5 h-3.5 accent-orange-500"
+                                          />
+                                          Also open Customer Queue lead &amp; Messenger DM
+                                        </label>
+                                        <div className="flex items-center gap-1.5">
+                                          <button
+                                            type="button"
+                                            onClick={() => setEditingRuleId(null)}
+                                            className="px-3 py-1.5 rounded-lg htv-card text-xs font-semibold cursor-pointer"
+                                          >
+                                            Cancel
+                                          </button>
+                                          <button
+                                            type="submit"
+                                            disabled={savingRuleEdit}
+                                            className="htv-gradient-btn px-3 py-1.5 rounded-lg text-xs font-semibold cursor-pointer disabled:opacity-50"
+                                          >
+                                            {savingRuleEdit ? 'Saving...' : 'Save'}
+                                          </button>
+                                        </div>
+                                      </div>
+                                    </form>
+                                  );
+                                }
+                                return (
+                                  <div
+                                    key={rule.id}
+                                    className={`flex items-start justify-between gap-2 flex-wrap sm:flex-nowrap min-w-0 p-3 rounded-xl htv-elevated transition-opacity ${
+                                      isActive ? '' : 'opacity-65'
+                                    }`}
+                                  >
+                                    <div className="min-w-0 flex-1 space-y-1">
+                                      <div className="flex items-center gap-2 flex-wrap min-w-0">
+                                        <span className="px-2 py-0.5 rounded-md bg-orange-500/15 text-orange-500 text-[11px] font-semibold font-mono-tabular max-w-full break-all">
+                                          "{rule.keyword}"
+                                        </span>
+                                        <span
+                                          className={`px-2 py-0.5 rounded-full text-[10px] font-semibold border shrink-0 ${
+                                            isActive
+                                              ? 'bg-emerald-500/15 text-emerald-500 border-emerald-500/30'
+                                              : 'bg-slate-500/15 text-[var(--htv-text-dim)] border-[var(--htv-border-subtle)]'
+                                          }`}
+                                        >
+                                          {isActive ? 'Active' : 'Paused'}
+                                        </span>
+                                        <span className="text-[11px] text-[var(--htv-text-dim)]">
+                                          {rule.hit_count} triggers
+                                        </span>
+                                        {rule.create_inquiry && (
+                                          <span className="text-[10px] text-emerald-500 font-medium">
+                                            · Auto-Lead + DM
+                                          </span>
+                                        )}
+                                      </div>
+                                      <p className="text-xs text-[var(--htv-text)] break-words [overflow-wrap:anywhere]">
+                                        {rule.reply_text}
+                                      </p>
+                                    </div>
+                                    {isAdminOrOwner && (
+                                      <div className="flex items-center gap-1 shrink-0 ml-auto">
+                                        <button
+                                          type="button"
+                                          disabled={togglingRuleId === rule.id}
+                                          onClick={() => handleToggleKeywordRule(rule.id, isActive)}
+                                          aria-label={
+                                            isActive
+                                              ? `Pause keyword rule ${rule.keyword}`
+                                              : `Activate keyword rule ${rule.keyword}`
+                                          }
+                                          title={isActive ? 'Pause rule' : 'Activate rule'}
+                                          className={`p-1.5 rounded-lg cursor-pointer disabled:opacity-50 ${
+                                            isActive
+                                              ? 'text-emerald-500 hover:bg-emerald-500/10'
+                                              : 'text-[var(--htv-text-dim)] hover:bg-[var(--htv-hover)]'
+                                          }`}
+                                        >
+                                          {isActive ? (
+                                            <Pause className="w-3.5 h-3.5" />
+                                          ) : (
+                                            <Play className="w-3.5 h-3.5" />
+                                          )}
+                                        </button>
+                                        <button
+                                          type="button"
+                                          onClick={() => {
+                                            setEditingRuleId(rule.id);
+                                            setEditRuleKeyword(rule.keyword);
+                                            setEditRuleReply(rule.reply_text);
+                                            setEditRuleCreateLead(Boolean(rule.create_inquiry));
+                                          }}
+                                          aria-label={`Edit keyword rule ${rule.keyword}`}
+                                          className="p-1.5 rounded-lg text-purple-400 hover:bg-purple-500/10 cursor-pointer"
+                                        >
+                                          <Pencil className="w-3.5 h-3.5" />
+                                        </button>
+                                        <button
+                                          type="button"
+                                          onClick={() => handleDeleteKeywordRule(rule.id)}
+                                          aria-label={`Delete keyword rule ${rule.keyword}`}
+                                          className="p-1.5 rounded-lg text-rose-500 hover:bg-rose-500/10 cursor-pointer"
+                                        >
+                                          <Trash2 className="w-3.5 h-3.5" />
+                                        </button>
+                                      </div>
+                                    )}
+                                  </div>
+                                );
+                              })}
                             </div>
                           </div>
                         </div>
@@ -3155,34 +3569,93 @@ export const CirclesView: React.FC<CirclesViewProps> = ({
                             </form>
 
                             <div className="space-y-2">
-                              {(automationData?.quick_replies || []).map((tmpl) => (
-                                <div
-                                  key={tmpl.id}
-                                  className="flex items-start justify-between gap-2 p-3 rounded-xl htv-elevated"
-                                >
-                                  <div className="min-w-0 space-y-0.5">
-                                    <div className="flex items-center gap-2">
-                                      <span className="text-xs font-semibold text-purple-600 dark:text-purple-300">
-                                        {tmpl.title}
-                                      </span>
-                                      <span className="text-[11px] text-[var(--htv-text-dim)]">
-                                        · used {tmpl.usage_count} times
-                                      </span>
-                                    </div>
-                                    <p className="text-xs text-[var(--htv-text)] break-words">
-                                      {tmpl.content}
-                                    </p>
-                                  </div>
-                                  <button
-                                    type="button"
-                                    onClick={() => handleDeleteQuickReply(tmpl.id)}
-                                    aria-label={`Delete template ${tmpl.title}`}
-                                    className="p-1.5 rounded-lg text-rose-500 hover:bg-rose-500/10 cursor-pointer shrink-0"
+                              {(automationData?.quick_replies || []).map((tmpl) => {
+                                const isEditing = editingTemplateId === tmpl.id;
+                                if (isEditing) {
+                                  return (
+                                    <form
+                                      key={tmpl.id}
+                                      onSubmit={handleSaveEditQuickReply}
+                                      className="p-3 rounded-xl htv-elevated border border-purple-500/35 space-y-2.5"
+                                    >
+                                      <input
+                                        type="text"
+                                        value={editTemplateTitle}
+                                        onChange={(e) => setEditTemplateTitle(e.target.value)}
+                                        placeholder="Template label"
+                                        maxLength={60}
+                                        className="w-full h-9 px-3 rounded-lg bg-[var(--htv-input)] border border-[var(--htv-border-subtle)] text-xs text-[var(--htv-text)]"
+                                      />
+                                      <textarea
+                                        rows={2}
+                                        value={editTemplateContent}
+                                        onChange={(e) => setEditTemplateContent(e.target.value)}
+                                        placeholder="Reply template text..."
+                                        maxLength={2000}
+                                        className="w-full p-2.5 rounded-lg bg-[var(--htv-input)] border border-[var(--htv-border-subtle)] text-xs text-[var(--htv-text)] resize-none"
+                                      />
+                                      <div className="flex justify-end gap-1.5">
+                                        <button
+                                          type="button"
+                                          onClick={() => setEditingTemplateId(null)}
+                                          className="px-3 py-1.5 rounded-lg htv-card text-xs font-semibold cursor-pointer"
+                                        >
+                                          Cancel
+                                        </button>
+                                        <button
+                                          type="submit"
+                                          disabled={savingTemplateEdit}
+                                          className="htv-gradient-btn px-3 py-1.5 rounded-lg text-xs font-semibold cursor-pointer disabled:opacity-50"
+                                        >
+                                          {savingTemplateEdit ? 'Saving...' : 'Save'}
+                                        </button>
+                                      </div>
+                                    </form>
+                                  );
+                                }
+                                return (
+                                  <div
+                                    key={tmpl.id}
+                                    className="flex items-start justify-between gap-2 flex-wrap sm:flex-nowrap min-w-0 p-3 rounded-xl htv-elevated"
                                   >
-                                    <Trash2 className="w-3.5 h-3.5" />
-                                  </button>
-                                </div>
-                              ))}
+                                    <div className="min-w-0 flex-1 space-y-0.5">
+                                      <div className="flex items-center gap-2 flex-wrap min-w-0">
+                                        <span className="text-xs font-semibold text-purple-600 dark:text-purple-300 break-words max-w-full">
+                                          {tmpl.title}
+                                        </span>
+                                        <span className="text-[11px] text-[var(--htv-text-dim)] shrink-0">
+                                          · used {tmpl.usage_count} times
+                                        </span>
+                                      </div>
+                                      <p className="text-xs text-[var(--htv-text)] break-words [overflow-wrap:anywhere]">
+                                        {tmpl.content}
+                                      </p>
+                                    </div>
+                                    <div className="flex items-center gap-1 shrink-0 ml-auto">
+                                      <button
+                                        type="button"
+                                        onClick={() => {
+                                          setEditingTemplateId(tmpl.id);
+                                          setEditTemplateTitle(tmpl.title);
+                                          setEditTemplateContent(tmpl.content);
+                                        }}
+                                        aria-label={`Edit template ${tmpl.title}`}
+                                        className="p-1.5 rounded-lg text-purple-400 hover:bg-purple-500/10 cursor-pointer"
+                                      >
+                                        <Pencil className="w-3.5 h-3.5" />
+                                      </button>
+                                      <button
+                                        type="button"
+                                        onClick={() => handleDeleteQuickReply(tmpl.id)}
+                                        aria-label={`Delete template ${tmpl.title}`}
+                                        className="p-1.5 rounded-lg text-rose-500 hover:bg-rose-500/10 cursor-pointer"
+                                      >
+                                        <Trash2 className="w-3.5 h-3.5" />
+                                      </button>
+                                    </div>
+                                  </div>
+                                );
+                              })}
                             </div>
                           </div>
                         </div>

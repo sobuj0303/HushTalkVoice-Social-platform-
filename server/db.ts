@@ -413,6 +413,7 @@ export function initDatabase(): void {
       keyword TEXT NOT NULL,
       reply_text TEXT NOT NULL,
       create_inquiry INTEGER NOT NULL DEFAULT 1,
+      is_active INTEGER NOT NULL DEFAULT 1,
       hit_count INTEGER NOT NULL DEFAULT 0,
       created_at TEXT NOT NULL DEFAULT (datetime('now'))
     );
@@ -436,6 +437,30 @@ export function initDatabase(): void {
       message TEXT NOT NULL,
       status TEXT NOT NULL DEFAULT 'new' CHECK (status IN ('new', 'in_progress', 'resolved')),
       last_reply TEXT NOT NULL DEFAULT '',
+      handled_by INTEGER REFERENCES users(id) ON DELETE SET NULL,
+      created_at TEXT NOT NULL DEFAULT (datetime('now')),
+      updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+    );
+
+    CREATE TABLE IF NOT EXISTS app_settings (
+      key TEXT PRIMARY KEY,
+      value TEXT NOT NULL DEFAULT '',
+      updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+    );
+
+    CREATE TABLE IF NOT EXISTS support_tickets (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      ticket_id TEXT NOT NULL DEFAULT '',
+      user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      category TEXT NOT NULL CHECK (category IN ('bug_error', 'crash_performance', 'account_access', 'feature_request', 'safety_policy', 'other')),
+      affected_area TEXT NOT NULL DEFAULT 'general',
+      subject TEXT NOT NULL,
+      description TEXT NOT NULL,
+      screenshot_url TEXT NOT NULL DEFAULT '',
+      device_info TEXT NOT NULL DEFAULT '',
+      telegram_forwarded INTEGER NOT NULL DEFAULT 0,
+      status TEXT NOT NULL DEFAULT 'submitted' CHECK (status IN ('submitted', 'in_review', 'resolved', 'closed')),
+      admin_reply TEXT NOT NULL DEFAULT '',
       handled_by INTEGER REFERENCES users(id) ON DELETE SET NULL,
       created_at TEXT NOT NULL DEFAULT (datetime('now')),
       updated_at TEXT NOT NULL DEFAULT (datetime('now'))
@@ -562,8 +587,22 @@ export function initDatabase(): void {
       SELECT RAISE(ABORT, 'Keyword auto-reply violates anti-spam link rule');
     END;
 
+    CREATE TRIGGER IF NOT EXISTS block_links_circle_keywords_update
+    BEFORE UPDATE OF keyword, reply_text ON circle_keyword_rules
+    WHEN has_blocked_link(NEW.keyword) = 1 OR has_blocked_link(NEW.reply_text) = 1
+    BEGIN
+      SELECT RAISE(ABORT, 'Keyword auto-reply violates anti-spam link rule');
+    END;
+
     CREATE TRIGGER IF NOT EXISTS block_links_circle_quick_replies_insert
     BEFORE INSERT ON circle_quick_replies
+    WHEN has_blocked_link(NEW.title) = 1 OR has_blocked_link(NEW.content) = 1
+    BEGIN
+      SELECT RAISE(ABORT, 'Quick reply template violates anti-spam link rule');
+    END;
+
+    CREATE TRIGGER IF NOT EXISTS block_links_circle_quick_replies_update
+    BEFORE UPDATE OF title, content ON circle_quick_replies
     WHEN has_blocked_link(NEW.title) = 1 OR has_blocked_link(NEW.content) = 1
     BEGIN
       SELECT RAISE(ABORT, 'Quick reply template violates anti-spam link rule');
@@ -575,6 +614,53 @@ export function initDatabase(): void {
     BEGIN
       SELECT RAISE(ABORT, 'Customer inquiry violates anti-spam link rule');
     END;
+
+    -- Query performance indexes for feeds, Circles aggregated feed, and engagement lookups
+    CREATE INDEX IF NOT EXISTS idx_circle_members_user_circle
+      ON circle_members(user_id, circle_id, role);
+    CREATE INDEX IF NOT EXISTS idx_circle_posts_circle_status_created
+      ON circle_posts(circle_id, status, created_at DESC, id DESC);
+    CREATE INDEX IF NOT EXISTS idx_circle_posts_approved_feed
+      ON circle_posts(circle_id, created_at DESC, id DESC)
+      WHERE status = 'approved';
+    CREATE INDEX IF NOT EXISTS idx_circle_posts_user_status_created
+      ON circle_posts(user_id, status, created_at DESC);
+    CREATE INDEX IF NOT EXISTS idx_circle_posts_status_created
+      ON circle_posts(status, created_at DESC, id DESC);
+    CREATE INDEX IF NOT EXISTS idx_circle_post_comments_post_created
+      ON circle_post_comments(post_id, created_at ASC, id ASC);
+    CREATE INDEX IF NOT EXISTS idx_circle_post_shares_post
+      ON circle_post_shares(post_id);
+    CREATE INDEX IF NOT EXISTS idx_posts_created
+      ON posts(created_at DESC, id DESC);
+    CREATE INDEX IF NOT EXISTS idx_posts_user_created
+      ON posts(user_id, created_at DESC, id DESC);
+    CREATE INDEX IF NOT EXISTS idx_post_comments_post_created
+      ON post_comments(post_id, created_at ASC);
+    CREATE INDEX IF NOT EXISTS idx_post_shares_post
+      ON post_shares(post_id);
+    CREATE INDEX IF NOT EXISTS idx_connections_status_users
+      ON connections(status, requester_id, receiver_id);
+    CREATE INDEX IF NOT EXISTS idx_connections_status_receiver
+      ON connections(status, receiver_id, requester_id);
+    CREATE INDEX IF NOT EXISTS idx_follows_follower
+      ON follows(follower_id, following_id);
+    CREATE INDEX IF NOT EXISTS idx_users_verified
+      ON users(is_verified, is_blocked, profile_visibility);
+    CREATE INDEX IF NOT EXISTS idx_circle_inquiries_conv_customer
+      ON circle_inquiries(conversation_id, customer_id, id DESC);
+    CREATE INDEX IF NOT EXISTS idx_messages_conv_id
+      ON messages(conversation_id, id ASC);
+    CREATE INDEX IF NOT EXISTS idx_messages_conv_sender_created
+      ON messages(conversation_id, sender_id, created_at);
+    CREATE INDEX IF NOT EXISTS idx_notifications_user_created
+      ON notifications(user_id, created_at DESC, id DESC);
+    CREATE INDEX IF NOT EXISTS idx_conv_members_user_conv
+      ON conversation_members(user_id, conversation_id);
+    CREATE INDEX IF NOT EXISTS idx_support_tickets_user_created
+      ON support_tickets(user_id, created_at DESC, id DESC);
+    CREATE INDEX IF NOT EXISTS idx_support_tickets_status_created
+      ON support_tickets(status, created_at DESC, id DESC);
   `);
 
   // Generate real playable seed audio files
@@ -655,6 +741,10 @@ export function initDatabase(): void {
   if (!postCols.some((c) => c.name === 'is_global')) {
     db.exec('ALTER TABLE posts ADD COLUMN is_global INTEGER NOT NULL DEFAULT 1');
   }
+  db.exec(`
+    CREATE INDEX IF NOT EXISTS idx_posts_circle_global
+      ON posts(circle_id, is_global, created_at DESC);
+  `);
 
   const circlePostCols = db.prepare('PRAGMA table_info(circle_posts)').all() as { name: string }[];
   if (!circlePostCols.some((c) => c.name === 'is_global')) {
@@ -673,6 +763,11 @@ export function initDatabase(): void {
   }
   if (!autoCols.some((c) => c.name === 'auto_inquiry_reply_message')) {
     db.exec("ALTER TABLE circle_automation_settings ADD COLUMN auto_inquiry_reply_message TEXT NOT NULL DEFAULT ''");
+  }
+
+  const kwCols = db.prepare('PRAGMA table_info(circle_keyword_rules)').all() as { name: string }[];
+  if (!kwCols.some((c) => c.name === 'is_active')) {
+    db.exec('ALTER TABLE circle_keyword_rules ADD COLUMN is_active INTEGER NOT NULL DEFAULT 1');
   }
 
   const postViewCols = db.prepare('PRAGMA table_info(post_views)').all() as { name: string }[];
